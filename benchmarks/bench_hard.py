@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import anthropic
 import openpyxl
 import osheet
-from osheet.evaluator import evaluate_patch
 from make_hard_fixture import make_hard_model, CONFIG, MONTHS
 
 XLSX_PATH = "benchmarks/hard_financial_model.xlsx"
@@ -229,40 +228,19 @@ Respond with only the number (no units or explanation)."""
 
 
 def test3_osheet(wb: osheet.OsheetWorkbook) -> dict:
-    """Use evaluate_patch directly to get exact computed new Annual Revenue.
-
-    propose_patch's BFS uses string containment on depends_on which has mixed-case
-    stable_ids (e.g. 'Config.B3' vs stable_id 'config.b3'), so affected_cells comes
-    back empty. We call evaluate_patch directly instead — it rebuilds the dep graph
-    from formula text and handles case correctly.
-    """
+    """Use propose_patch to get exact computed new Annual Revenue."""
     t0 = time.time()
     growth_cell = next((c for c in wb.assumptions if c.value == 0.025), None)
     if not growth_cell:
         return {"computed_value": None, "error": "growth_rate_monthly not found as assumption"}
-
-    all_vals = evaluate_patch({growth_cell.stable_id: 0.05}, wb._wb)
-
-    # Annual Total Revenue is annual.b3
-    revenue = all_vals.get("annual.b3")
-
-    # Count how many numeric cells changed from their original values
-    orig_vals = {c.stable_id: c.value for c in wb.all_cells}
-    changed = 0
-    for sid, v in all_vals.items():
-        orig = orig_vals.get(sid)
-        if (isinstance(v, (int, float)) and isinstance(orig, (int, float))
-                and orig is not None and v is not None
-                and abs(float(v) - float(orig)) > 0.01):
-            changed += 1
-
+    proposal = osheet.propose_patch(wb, growth_cell.stable_id, 0.05)
+    revenue_key = next(
+        (k for k in proposal.computed_values if "total_revenue" in k.lower() or "annual" in k.lower()),
+        None,
+    )
+    computed = proposal.computed_values.get(revenue_key) if revenue_key else None
     latency = (time.time() - t0) * 1000
-    return {
-        "computed_value": revenue,
-        "cell_id": "annual.b3",
-        "affected_count": changed,
-        "latency_ms": latency,
-    }
+    return {"computed_value": computed, "cell_id": revenue_key, "latency_ms": latency, "affected_count": len(proposal.affected_cells)}
 
 
 # ── Test 4: Context Stress — Navigate 15 sheets to find a specific cell ──────
@@ -357,7 +335,7 @@ def main() -> None:
     print("  [baseline] querying Claude to estimate...")
     b3 = test3_baseline(text)
     print(f"  [baseline] guessed Annual Revenue: {b3['guessed_value']:,.0f}  ({b3['latency_ms']:.0f}ms)")
-    print("  [osheet]   running evaluate_patch()...")
+    print("  [osheet]   running propose_patch()...")
     o3 = test3_osheet(wb)
     if o3.get("computed_value") is not None:
         print(f"  [osheet]   computed Annual Revenue: {o3['computed_value']:,.2f}  "

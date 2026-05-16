@@ -69,7 +69,7 @@ class OsheetWorkbook:
         cell = self._wb.get_cell(stable_id)
         if cell is None:
             return TraceResult(cell_id=stable_id)
-        downstream = [c.stable_id for c in self._wb.all_cells if stable_id in c.depends_on]
+        downstream = [c.stable_id for c in self._wb.all_cells if stable_id in (d.lower() for d in c.depends_on)]
         return TraceResult(cell_id=stable_id, upstream=cell.depends_on, downstream=downstream)
 
     def propose_patch(self, stable_id: str, new_value: Any) -> PatchProposal:
@@ -85,7 +85,7 @@ class OsheetWorkbook:
             if cid in visited:
                 continue
             visited.add(cid)
-            queue.extend(c.stable_id for c in self._wb.all_cells if cid in c.depends_on)
+            queue.extend(c.stable_id for c in self._wb.all_cells if cid in (d.lower() for d in c.depends_on))
         visited.discard(stable_id)
 
         # Formula evaluation — graceful degradation if it fails
