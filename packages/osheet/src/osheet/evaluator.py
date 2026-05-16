@@ -243,6 +243,44 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
     return np.array([vals])
 
 
+def _strip_numeric_formatting(s: str) -> str:
+    """Strip Excel-display formatting (commas, accounting parens, currency, percent)
+    from a string. Return the cleaned string if it's now plain-numeric (e.g. '3827',
+    '-2032', '0.125'), otherwise return the original string unchanged.
+
+    This lets the formulas library's arithmetic coerce numeric-looking text
+    while our aggregate overrides still see them as strings to skip.
+    """
+    if not isinstance(s, str):
+        return s
+    stripped = s.strip()
+    if not stripped:
+        return s
+    is_negative = False
+    if stripped.startswith("(") and stripped.endswith(")"):
+        is_negative = True
+        stripped = stripped[1:-1].strip()
+    for sym in ("$", "€", "£", "¥"):
+        if stripped.startswith(sym):
+            stripped = stripped[len(sym):].strip()
+            break
+    is_percent = stripped.endswith("%")
+    if is_percent:
+        stripped = stripped[:-1].strip()
+    cleaned = stripped.replace(",", "")
+    try:
+        v = float(cleaned)
+        if is_percent:
+            v /= 100.0
+        if is_negative:
+            v = -v
+        # Return cleaned string so it remains text-typed for aggregates,
+        # but parseable for arithmetic
+        return str(v)
+    except (ValueError, TypeError):
+        return s  # not numeric — leave unchanged
+
+
 def _coerce_string_to_float(s: str) -> float:
     """Attempt Excel-compatible numeric coercion. Returns nan if not parseable.
 
@@ -435,13 +473,12 @@ def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], pars
             v = value_map.get(lookup)
             if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                 kwargs[input_key] = _to_float(v)
+            elif isinstance(v, str):
+                # Strip Excel formatting (commas, parens, currency) but KEEP as string.
+                # - aggregate overrides (AVERAGE/SUM/etc) skip strings → Excel-faithful
+                # - formulas library's arithmetic coerces clean numeric strings → also Excel-faithful
+                kwargs[input_key] = _strip_numeric_formatting(v)
             else:
-                # Strings, numpy types, etc. pass through unchanged.
-                # The formulas library handles strings appropriately:
-                #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
-                #   - arithmetic coerces clean numeric strings, returns #VALUE! for
-                #     comma-formatted/non-numeric (matches Excel)
-                # This matches Excel's stored-type semantics.
                 kwargs[input_key] = v
     result = _scalar(func(**kwargs))
     return int(result)
@@ -484,13 +521,12 @@ def _eval_subexpr_scalar(
                 v = value_map.get(lookup)
                 if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
+                elif isinstance(v, str):
+                    # Strip Excel formatting (commas, parens, currency) but KEEP as string.
+                    # - aggregate overrides (AVERAGE/SUM/etc) skip strings → Excel-faithful
+                    # - formulas library's arithmetic coerces clean numeric strings → also Excel-faithful
+                    kwargs[input_key] = _strip_numeric_formatting(v)
                 else:
-                    # Strings, numpy types, etc. pass through unchanged.
-                    # The formulas library handles strings appropriately:
-                    #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
-                    #   - arithmetic coerces clean numeric strings, returns #VALUE! for
-                    #     comma-formatted/non-numeric (matches Excel)
-                    # This matches Excel's stored-type semantics.
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:
@@ -1112,13 +1148,12 @@ def _eval_one_cell(
                 v = value_map.get(lookup_key)
                 if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
+                elif isinstance(v, str):
+                    # Strip Excel formatting (commas, parens, currency) but KEEP as string.
+                    # - aggregate overrides (AVERAGE/SUM/etc) skip strings → Excel-faithful
+                    # - formulas library's arithmetic coerces clean numeric strings → also Excel-faithful
+                    kwargs[input_key] = _strip_numeric_formatting(v)
                 else:
-                    # Strings, numpy types, etc. pass through unchanged.
-                    # The formulas library handles strings appropriately:
-                    #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
-                    #   - arithmetic coerces clean numeric strings, returns #VALUE! for
-                    #     comma-formatted/non-numeric (matches Excel)
-                    # This matches Excel's stored-type semantics.
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:

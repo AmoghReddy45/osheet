@@ -1156,3 +1156,67 @@ def test_empty_cell_arithmetic_still_zero():
     result = evaluate_patch({}, workbook)
     b1 = next(c for c in workbook.all_cells if c.formula)
     assert result[b1.stable_id] == 0
+
+
+def test_arithmetic_on_comma_formatted_text_coerces_like_excel():
+    """=A1+B1+C1 where all cells are text '3,827' '5,159' '791' should sum to 9777,
+    matching Excel's behavior of coercing comma-formatted strings in arithmetic."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '3,827'
+    ws['B1'] = '5,159'
+    ws['C1'] = '791'
+    ws['D1'] = '=A1+B1+C1'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[d1.stable_id] == 9777.0
+
+
+def test_aggregate_still_skips_text_after_strip():
+    """=AVERAGE(text_cell, numeric_cell) should still skip the text after our strip."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '3,827'
+    ws['B1'] = 4908
+    ws['C1'] = '=AVERAGE(A1, B1)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[c1.stable_id] == 4908.0
+
+
+def test_arithmetic_on_accounting_negative_coerces():
+    """=A1+100 where A1 is text '(2,032)' should equal -1932 (Excel-faithful)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '(2,032)'
+    ws['B1'] = '=A1+100'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert abs(result[b1.stable_id] - (-1932)) < 0.01
