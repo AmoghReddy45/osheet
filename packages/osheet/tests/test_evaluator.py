@@ -740,3 +740,71 @@ def test_date_comparison(date_bytes):
     result = evaluate_patch({}, workbook)
     cell = _cell_by_formula(workbook, "B3 > B4")
     assert bool(result[cell.stable_id]) is True
+
+
+# --- Range resolver tests ---------------------------------------------------
+
+
+def test_expand_range_bare():
+    vm = {"S!A1": 1, "S!B1": 2, "S!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("A1:C1", "S", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_with_sheet_both_sides():
+    vm = {"S!A1": 1, "S!B1": 2, "S!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("S!A1:S!C1", "OTHER", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_with_sheet_left_only():
+    vm = {"S!A1": 1, "S!B1": 2, "S!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("S!A1:C1", "OTHER", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_dollar_anchored():
+    vm = {"S!A1": 1, "S!B1": 2, "S!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("$A$1:$C$1", "S", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_mixed_quoting():
+    vm = {"TBA!A1": 1, "TBA!B1": 2, "TBA!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("TBA!$A$1:'TBA'!C1", "OTHER", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_quoted_sheet_with_space():
+    vm = {"MY SHEET!A1": 1, "MY SHEET!B1": 2, "MY SHEET!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("'My Sheet'!A1:'My Sheet'!C1", "X", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_expand_range_formulas_lib_emitted_form():
+    """formulas library emits ranges with surrounding parens and spaces around ':'"""
+    vm = {"TBA!A1": 1, "TBA!B1": 2, "TBA!C1": 3}
+    from osheet.evaluator import _expand_range
+    arr = _expand_range("(TBA!A1: TBA!C1)", "X", vm)
+    assert list(arr[0]) == [1.0, 2.0, 3.0]
+
+
+def test_parse_refs_mixed_anchored_range():
+    from osheet.analyzer.graph import _parse_refs
+    refs = _parse_refs("=SUM(TBA!$D$10:'TBA'!I10)", "DEFAULT")
+    cells = {(r[1], r[2]) for r in refs if r[0] == "TBA"}
+    expected = {(c, 10) for c in range(4, 10)}  # D=4, I=9 inclusive
+    assert cells == expected
+
+
+def test_parse_refs_same_sheet_range():
+    from osheet.analyzer.graph import _parse_refs
+    refs = _parse_refs("=SUM(Sheet1!A1:Sheet1!C1)", "DEFAULT")
+    cells_in_sheet1 = [(r[1], r[2]) for r in refs if r[0] == "Sheet1"]
+    assert len(cells_in_sheet1) == 3  # A1, B1, C1

@@ -10,7 +10,7 @@ import formulas
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 from osheet.models import Workbook
-from osheet.analyzer.graph import _parse_refs
+from osheet.analyzer.graph import _parse_refs, _parse_range_endpoints
 
 
 # Excel epoch (1900 date system). Excel's serial 1 is 1900-01-01, but because
@@ -57,37 +57,40 @@ def _normalize_input_key(input_key: str) -> str:
 
     formulas lib outputs: 'FIXED ASSETS'!D15 (with quotes for sheet names with spaces)
     Our _fkey() outputs:  FIXED ASSETS!D15   (no quotes)
+
+    Also handles the range-emitted form ``(SHEET!A1: SHEET!B2)`` with wrapping
+    parens and whitespace around the colon.
     """
-    if input_key.startswith("'"):
-        # Find the closing single quote
-        bang = input_key.find("'", 1)
-        if bang != -1 and input_key[bang + 1 : bang + 2] == "!":
-            sheet = input_key[1:bang]
-            rest = input_key[bang + 2 :]
+    s = input_key.strip()
+    # Strip wrapping parens (formulas lib emits e.g. "(TBA!D10: TBA!I10)")
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    # Remove whitespace around ":" so downstream string-splitting works.
+    s = re.sub(r"\s*:\s*", ":", s)
+    if s.startswith("'"):
+        bang = s.find("'", 1)
+        if bang != -1 and s[bang + 1 : bang + 2] == "!":
+            sheet = s[1:bang]
+            rest = s[bang + 2 :]
             return f"{sheet}!{rest}"
-    return input_key
+    return s
 
 
 def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any]) -> np.ndarray:
     """Turn 'B2:B13' or 'SHEET!B2:SHEET!B13' into a numpy row array for SUM etc.
 
+    Tolerant of all forms emitted by the formulas library and authored Excel
+    expressions: bare ranges, mixed quoting (``TBA!$D$10:'TBA'!I10``), repeated
+    sheet prefixes on both sides, quoted sheet names with spaces, and wrapping
+    parens with whitespace around the colon.
+
     Preserves string values (uses an object dtype) so that text-criteria
     aggregations such as SUMIF can match labels in the criteria range."""
-    # Strip quotes from sheet name portion if present (e.g. 'FIXED ASSETS'!B2:B13)
     range_key = _normalize_input_key(range_key)
-    if "!" in range_key:
-        left, right = range_key.split(":", 1)
-        sheet = left.split("!")[0]
-        start_cell = left.split("!")[1]
-        end_cell = right.split("!")[1] if "!" in right else right
-    else:
-        sheet = default_sheet
-        start_cell, end_cell = range_key.split(":", 1)
-
-    c1 = column_index_from_string("".join(c for c in start_cell if c.isalpha()))
-    r1 = int("".join(c for c in start_cell if c.isdigit()))
-    c2 = column_index_from_string("".join(c for c in end_cell if c.isalpha()))
-    r2 = int("".join(c for c in end_cell if c.isdigit()))
+    endpoints = _parse_range_endpoints(range_key, default_sheet)
+    if endpoints is None:
+        return np.array([[np.nan]])
+    sheet, c1, r1, c2, r2 = endpoints
 
     vals = []
     has_text = False
@@ -233,6 +236,7 @@ def _find_innermost_offset(formula: str) -> tuple[int, int] | None:
 
 
 def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], parser: Any) -> int:
+    expr = _collapse_redundant_sheet_in_range(expr)
     func = parser.ast(f"={expr}")[1].compile()
     kwargs: dict[str, Any] = {}
     sheet_prefix = default_sheet.upper() + "!"
@@ -273,6 +277,7 @@ def _eval_subexpr_scalar(
             text = _rewrite_subtotal(text)
         if "OFFSET" in text.upper():
             text = _resolve_offset_in_formula(text, default_sheet, value_map, parser)
+        text = _collapse_redundant_sheet_in_range(text)
         if not text.startswith("="):
             text = "=" + text
         func = parser.ast(text)[1].compile()
@@ -362,21 +367,31 @@ def _parse_single_cell_ref(ref: str) -> tuple[str | None, str, int]:
     return sheet, col_letters.upper(), int(row_str)
 
 
-# Matches `<sheet>!<cell>:<sheet>!<cell>` where sheets are identical.
-# Captures both quoted ('Sheet Name') and bare (Sheet1) forms.
+# Matches `<sheet>!<cell>:<sheet>!<cell>` where sheets may be quoted or bare on
+# either side independently. Anchored at non-identifier boundaries so we don't
+# eat surrounding tokens (e.g. ``=SUM(``).
 _REDUNDANT_SHEET_RE = re.compile(
+    r"(?<![A-Za-z0-9_$])"
     r"(?:'([^']+)'|([A-Za-z_][\w ]*))!(\$?[A-Z]+\$?\d+)"
-    r":"
+    r"\s*:\s*"
     r"(?:'([^']+)'|([A-Za-z_][\w ]*))!(\$?[A-Z]+\$?\d+)"
+    r"(?![A-Za-z0-9_$])"
 )
 
 
 def _collapse_redundant_sheet_in_range(text: str) -> str:
+    """Collapse ``Sheet!X:Sheet!Y`` (any quoting combo) → ``Sheet!X:Y``.
+
+    The left-side prefix wins so quoting style on the left is preserved
+    verbatim. This is required because the ``formulas`` library treats the
+    duplicated-sheet form as two scalars rather than a range.
+    """
     def repl(m: re.Match) -> str:
         left_sheet = m.group(1) or m.group(2)
         right_sheet = m.group(4) or m.group(5)
         if left_sheet.upper() == right_sheet.upper():
-            left_prefix = m.group(0).split(":", 1)[0]
+            # Use the original left-prefix (preserves quoting and `$` anchors).
+            left_prefix = m.group(0).split(":", 1)[0].rstrip()
             return f"{left_prefix}:{m.group(6)}"
         return m.group(0)
     return _REDUNDANT_SHEET_RE.sub(repl, text)
@@ -793,6 +808,7 @@ def _eval_one_cell(
                     )
                     if handled:
                         return val
+        formula_text = _collapse_redundant_sheet_in_range(formula_text)
         func = parser.ast(formula_text)[1].compile()
         kwargs: dict[str, Any] = {}
         sheet_prefix = sheet_name.upper() + "!"
