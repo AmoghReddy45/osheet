@@ -1298,6 +1298,94 @@ def test_iferror_returns_empty_string_fallback():
     assert result[a1.stable_id] == ""
 
 
+def test_iferror_catches_match_na():
+    """=IFERROR(MATCH(99, A1:A3, 0), "missing") should return "missing" (MATCH yields #N/A)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 1
+    ws['A2'] = 2
+    ws['A3'] = 3
+    ws['B1'] = '=IFERROR(MATCH(99,A1:A3,0),"missing")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == "missing"
+
+
+def test_iferror_catches_index_match_na():
+    """=IFERROR(INDEX(B1:B3, 0, MATCH(99, A1:A3, 0)), 0) -> 0 (runway_budget bug)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 1
+    ws['A2'] = 2
+    ws['A3'] = 3
+    ws['B1'] = 10
+    ws['B2'] = 20
+    ws['B3'] = 30
+    ws['C1'] = '=IFERROR(INDEX(B1:B3,0,MATCH(99,A1:A3,0)),0)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[c1.stable_id] == 0
+
+
+def test_iferror_catches_na_function():
+    """=IFERROR(NA(), "fallback") should return "fallback"."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '=IFERROR(NA(),"fallback")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[a1.stable_id] == "fallback"
+
+
+def test_iferror_passthrough_match_hit():
+    """=IFERROR(MATCH(2, A1:A3, 0), 99) -> 2 (regression: success path unchanged)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 1
+    ws['A2'] = 2
+    ws['A3'] = 3
+    ws['B1'] = '=IFERROR(MATCH(2,A1:A3,0),99)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == 2
+
+
 def test_isblank_returns_true_for_empty_cell():
     """ISBLANK on a truly empty cell should return TRUE (Excel-faithful)."""
     import io, openpyxl

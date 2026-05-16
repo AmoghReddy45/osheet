@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import formulas
+from formulas.tokens.operand import XlError
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 from osheet.models import Workbook
@@ -740,11 +741,9 @@ def _try_iferror_short_circuit(
     is_error = False
     if expr_val is None:
         is_error = True
-    elif isinstance(expr_val, str) and expr_val.startswith("#") and expr_val.endswith("!"):
+    elif isinstance(expr_val, XlError):
         is_error = True
-    elif isinstance(expr_val, str) and expr_val in (
-        "#N/A", "#NAME?", "#NULL!", "#DIV/0!", "#NUM!", "#REF!", "#VALUE!"
-    ):
+    elif isinstance(expr_val, str) and str(expr_val).startswith("#"):
         is_error = True
     elif isinstance(expr_val, float):
         if math.isnan(expr_val) or math.isinf(expr_val):
