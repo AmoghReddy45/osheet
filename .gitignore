@@ -14,3 +14,4 @@ htmlcov/
 .coverage
 benchmarks/dummy_financial_model.xlsx
 benchmarks/hard_financial_model.xlsx
+benchmarks/circ_ref_model.xlsx
