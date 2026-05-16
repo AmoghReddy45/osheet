@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "osheet"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1",
+    "networkx>=3.3",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov", "httpx"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/osheet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

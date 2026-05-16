@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+node_modules/
+.next/
+.env
+.env.local
+*.osheet
+.superpowers/
+.pytest_cache/
+htmlcov/
+.coverage
