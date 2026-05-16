@@ -60,7 +60,7 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
 
 def _to_float(val: Any) -> float:
     if val is None:
-        return np.nan
+        return 0.0  # Excel treats empty/missing cells as 0 in arithmetic
     if isinstance(val, (int, float)):
         return float(val)
     # Try numpy scalar extraction
