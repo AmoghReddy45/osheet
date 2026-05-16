@@ -751,18 +751,97 @@ def _resolve_structured_refs(
     return _STRUCTURED_REF_RE.sub(_sub, formula)
 
 
+def _extract_offset_deps(
+    formula: str,
+    default_sheet: str,
+    static_value_map: dict[str, Any],
+    parser: Any,
+) -> list[str]:
+    """Find OFFSET expressions in a formula and return the value_map-style
+    refs they would point to, based on a static value_map of constants.
+
+    Returns refs as ``'SHEET!COLROW'`` (matching ``_fkey`` key format). For
+    OFFSETs whose row/col args can't be evaluated statically (e.g. they
+    reference other formula cells), the corresponding entry is omitted —
+    no worse than the existing behavior.
+    """
+    deps: list[str] = []
+    if "OFFSET" not in formula.upper():
+        return deps
+    upper = formula.upper()
+    i = 0
+    while True:
+        idx = upper.find("OFFSET(", i)
+        if idx == -1:
+            break
+        # Must be at start of token (prev char non-alnum/underscore) to avoid
+        # matching e.g. MYOFFSET(.
+        if idx > 0 and (formula[idx - 1].isalnum() or formula[idx - 1] == "_"):
+            i = idx + 1
+            continue
+        open_paren = idx + len("OFFSET")
+        close = _find_matching_paren(formula, open_paren)
+        if close == -1:
+            break
+        body = formula[open_paren + 1 : close]
+        parts = _split_top_level_commas(body)
+        if len(parts) < 3:
+            i = close + 1
+            continue
+        ref_text = parts[0].strip()
+        try:
+            sheet, col_letters, base_row = _parse_single_cell_ref(ref_text)
+            base_col = column_index_from_string(col_letters)
+            rows_val = _eval_subexpr(
+                parts[1].strip(), default_sheet, static_value_map, parser
+            )
+            cols_val = _eval_subexpr(
+                parts[2].strip(), default_sheet, static_value_map, parser
+            )
+            new_col = base_col + int(cols_val)
+            new_row = base_row + int(rows_val)
+            if new_col >= 1 and new_row >= 1:
+                target_sheet = (sheet or default_sheet).upper()
+                deps.append(
+                    f"{target_sheet}!{get_column_letter(new_col)}{new_row}"
+                )
+        except Exception:
+            pass
+        i = close + 1
+    return deps
+
+
 def _build_dep_graph(
     workbook: Workbook,
 ) -> dict[str, set[str]]:
     """
     Build {stable_id -> set of stable_ids it depends on} using formula text,
     bypassing the (potentially stale) cell.depends_on field.
+
+    Also includes OFFSET-discovered edges when the OFFSET row/col args are
+    statically resolvable (i.e. reference non-formula constant cells). This
+    ensures Tarjan orders OFFSET targets before their consumers — without
+    this, an OFFSET target may be evaluated as 0 because its source hasn't
+    been computed yet.
     """
+    parser = formulas.Parser()
+
     # Position lookup: (sheet_name, col, row) -> stable_id
     pos_to_id: dict[tuple[str, int, int], str] = {}
+    # Key lookup: SHEET!COLROW -> stable_id (matches _fkey output)
+    key_to_id: dict[str, str] = {}
+    # Static value_map seeded only with non-formula (constant) cells. OFFSET
+    # arg evaluation against this map will fail for cells whose args
+    # reference formula cells — those OFFSETs are then skipped here, matching
+    # the original (pre-fix) dep-graph behavior.
+    static_value_map: dict[str, Any] = {}
     for sheet in workbook.sheets:
         for cell in sheet.cells:
             pos_to_id[(sheet.name, cell.col, cell.row)] = cell.stable_id
+            k = _fkey(sheet.name, cell.row, cell.col)
+            key_to_id[k] = cell.stable_id
+            if cell.formula is None:
+                static_value_map[k] = cell.value
 
     deps: dict[str, set[str]] = {}
     for sheet in workbook.sheets:
@@ -775,6 +854,20 @@ def _build_dep_graph(
                 sid = pos_to_id.get((sname, col, row))
                 if sid:
                     dep_ids.add(sid)
+
+            # Include OFFSET targets when row/col args are statically
+            # resolvable (constants from non-formula cells).
+            offset_refs = _extract_offset_deps(
+                cell.formula,
+                sheet.name.upper(),
+                static_value_map,
+                parser,
+            )
+            for ref_key in offset_refs:
+                sid = key_to_id.get(ref_key)
+                if sid and sid != cell.stable_id:  # don't create self-edges
+                    dep_ids.add(sid)
+
             deps[cell.stable_id] = dep_ids
     return deps
 

@@ -891,3 +891,59 @@ def test_sum_over_comma_formatted_range():
     result = evaluate_patch({}, workbook)
     s = next(c for c in workbook.all_cells if c.formula and "SUM" in c.formula)
     assert abs(result[s.stable_id] - 3000) < 0.01
+
+
+def test_offset_self_row_dependency_resolves_in_order():
+    """OFFSET to a cell in the same row should force that cell to be evaluated first."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Sheet1"
+    ws['A1'] = 100
+    # B1 depends on A1 via OFFSET, not direct ref
+    ws['B1'] = "=OFFSET(B1,0,-1)+1"
+    # C1 depends on B1 via OFFSET
+    ws['C1'] = "=OFFSET(C1,0,-1)+1"
+    # D1 depends on C1 via OFFSET
+    ws['D1'] = "=OFFSET(D1,0,-1)+1"
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+
+    b1 = next(c for c in workbook.all_cells if c.col == 2 and c.row == 1)
+    c1 = next(c for c in workbook.all_cells if c.col == 3 and c.row == 1)
+    d1 = next(c for c in workbook.all_cells if c.col == 4 and c.row == 1)
+    # B1 = A1 + 1 = 101; C1 = B1 + 1 = 102; D1 = C1 + 1 = 103
+    assert abs(result[b1.stable_id] - 101) < 0.01
+    assert abs(result[c1.stable_id] - 102) < 0.01
+    assert abs(result[d1.stable_id] - 103) < 0.01
+
+
+def test_offset_with_static_constant_args_adds_dep():
+    """Verify that _build_dep_graph captures OFFSET edges when args are constants."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Sheet1"
+    ws['A1'] = 1
+    ws['B1'] = 2
+    ws['C1'] = 3
+    ws['D1'] = "=OFFSET(D1,0,-3)*10"  # references A1 via OFFSET
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch, _build_dep_graph
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+
+    deps = _build_dep_graph(workbook)
+    d1 = next(c for c in workbook.all_cells if c.col == 4 and c.row == 1)
+    a1 = next(c for c in workbook.all_cells if c.col == 1 and c.row == 1)
+    assert a1.stable_id in deps[d1.stable_id]
+
+    result = evaluate_patch({}, workbook)
+    assert abs(result[d1.stable_id] - 10) < 0.01  # A1=1 * 10
