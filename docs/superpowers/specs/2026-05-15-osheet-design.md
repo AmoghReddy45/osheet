@@ -98,9 +98,9 @@ A zip package:
 workbook.json        # metadata + manifest
 sheets.json          # Sheet + Table + Cell tree
 formula_graph.json   # adjacency list DAG
-styles.json          # visual formatting (for roundtrip)
-original.xlsx        # embedded original
 ```
+
+Note: `styles.json` and `original.xlsx` were intentionally omitted from v1 — not needed for agent consumption.
 
 ---
 
@@ -141,7 +141,7 @@ Finds contiguous rectangular regions with a header row. Uses formatting density,
 Samples values per column → infers `dtype`. Extracts formula patterns for formula columns (e.g. `=B{r}*C{r}` repeated).
 
 **Pass 3 — Cell role classification**  
-Classifies each cell as `assumption` / `output` / `intermediate` / `label` / `unknown` using: formula presence, in/out-degree in dependency graph, fill color heuristics (yellow = assumption convention), positional heuristics.
+Classifies each cell as `assumption` / `output` / `intermediate` / `label` / `unknown` using: formula presence, in/out-degree in dependency graph, fill color heuristics (yellow = assumption convention), positional heuristics. Implementation note: openpyxl returns 8-character ARGB hex strings (e.g. `"00FFFF00"`); color comparisons use the last 6 characters to strip the alpha prefix.
 
 **Pass 4 — Formula dependency graph**  
 Parses every formula (regex + grammar) to build a DAG. Handles `SUM`, `IF`, `VLOOKUP`, named ranges, cross-sheet references. Resolves all references to stable IDs.
@@ -153,7 +153,10 @@ Deterministic, human-readable IDs: `{sheet}.{table}.{column}.{row_label}`. Falls
 
 ## Web App — Inspector UI
 
+**Stack:** Next.js 16 (App Router) + Tailwind CSS v4. Tailwind v4 requires no `tailwind.config.ts` — theme tokens (colors, fonts) live in `globals.css` via `@theme`.
+
 **Design language:** Geist + GeistMono fonts, `#171717` dark canvas, minimal chromatic accent.  
+Role colors: assumption = `#d4a96a`, output = `#6ab07a`, intermediate = `#6a8fd4`.  
 **Reference:** `/Users/amoghreddy/Downloads/Untitled Sheet__2026-05-15_20-52-58.html` (structural + component reference).
 
 **Three-panel layout:**
@@ -198,6 +201,15 @@ Full Python API surface tested against known inputs/outputs. These protect agent
 
 **Metrics:** assumption detection accuracy, output cell identification accuracy, formula trace correctness, query latency, agent edit safety (no silent breakage).
 
+### Results (3-run average, claude-opus-4-7)
+
+| Approach | Accuracy | Avg Latency |
+|---|---|---|
+| Baseline (raw CSV text) | 100% | ~3,688 ms |
+| osheet (structured context) | 100% | ~5,702 ms |
+
+Both approaches achieve perfect accuracy across all 5 benchmark questions. The osheet approach carries higher latency due to richer context generation on the structured workbook; the value proposition is reliability and agent-safety rather than raw speed.
+
 ---
 
 ## Tech Stack
@@ -210,8 +222,8 @@ Full Python API surface tested against known inputs/outputs. These protect agent
 | Graph | networkx | DAG traversal, shortest path |
 | Data validation | pydantic v2 | Fast, typed models |
 | Web backend | FastAPI | Shares Python with library |
-| Web frontend | Next.js 14 (App Router) | Best-in-class DX |
-| Styling | Tailwind CSS + Geist | Matches design language |
+| Web frontend | Next.js 16 (App Router) | Best-in-class DX |
+| Styling | Tailwind CSS v4 + Geist | Matches design language; theme tokens in globals.css via @theme |
 | Testing | pytest + httpx | Standard Python |
 | CI | GitHub Actions | Already on GitHub |
 
