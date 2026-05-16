@@ -14,6 +14,131 @@ from osheet.models import Workbook
 from osheet.analyzer.graph import _parse_refs, _parse_range_endpoints
 
 
+# ---------------------------------------------------------------------------
+# Excel-faithful aggregate overrides.
+#
+# The `formulas` library's built-in AVERAGE/SUM/etc. don't match Excel when
+# called with mixed text/numeric SCALAR arguments. E.g.
+#   AVERAGE('3,827', 4908) returns 153512.0  (buggy comma parsing)
+#   SUM('3,827', 4908)     returns #VALUE!
+# whereas Excel skips text-typed scalars in aggregates and yields 4908 in
+# both cases. We register Excel-faithful replacements at module import time
+# via formulas.get_functions()[NAME] = fn.
+#
+# NOTE: SUMIF/SUMIFS/AVERAGEIF/AVERAGEIFS are intentionally NOT overridden;
+# their range+criteria semantics are different and are already exercised by
+# the existing test suite.
+# ---------------------------------------------------------------------------
+
+
+def _to_numeric_skip_text(args):
+    """Flatten args; yield only numeric values, skip strings/None/text.
+    Used by aggregates that match Excel's text-skipping semantics."""
+    for a in args:
+        if a is None:
+            continue
+        if isinstance(a, bool):
+            yield float(a)  # TRUE=1, FALSE=0
+        elif isinstance(a, (int, float, np.floating, np.integer)):
+            fv = float(a)
+            if not np.isnan(fv):
+                yield fv
+        elif isinstance(a, np.ndarray):
+            for elem in a.flat:
+                if isinstance(elem, bool) or isinstance(elem, np.bool_):
+                    yield float(elem)
+                elif isinstance(elem, (int, float, np.floating, np.integer)):
+                    fv = float(elem)
+                    if not np.isnan(fv):
+                        yield fv
+                # skip strings, None, NaN
+        elif isinstance(a, str):
+            continue  # Excel skips text-typed scalars in aggregates
+        else:
+            try:
+                fv = float(a)
+                if not np.isnan(fv):
+                    yield fv
+            except (ValueError, TypeError):
+                continue
+
+
+def _excel_average(*args):
+    nums = list(_to_numeric_skip_text(args))
+    if not nums:
+        # Excel returns #DIV/0!. We return nan as a sentinel — the formulas
+        # library and our _scalar()/result pipeline handle nan gracefully.
+        return np.nan
+    return sum(nums) / len(nums)
+
+
+def _excel_sum(*args):
+    return sum(_to_numeric_skip_text(args))
+
+
+def _excel_min(*args):
+    nums = list(_to_numeric_skip_text(args))
+    return min(nums) if nums else 0
+
+
+def _excel_max(*args):
+    nums = list(_to_numeric_skip_text(args))
+    return max(nums) if nums else 0
+
+
+def _excel_count(*args):
+    """COUNT: count of numeric values (ignores text, blanks, errors)."""
+    return len(list(_to_numeric_skip_text(args)))
+
+
+def _excel_counta(*args):
+    """COUNTA: count of non-blank values including text."""
+    n = 0
+    for a in args:
+        if a is None:
+            continue
+        if isinstance(a, np.ndarray):
+            for elem in a.flat:
+                if elem is None:
+                    continue
+                if isinstance(elem, str) and elem == "":
+                    continue
+                if isinstance(elem, float) and np.isnan(elem):
+                    continue
+                n += 1
+        else:
+            if isinstance(a, str) and a == "":
+                continue
+            if isinstance(a, float) and np.isnan(a):
+                continue
+            n += 1
+    return n
+
+
+def _excel_product(*args):
+    nums = list(_to_numeric_skip_text(args))
+    result = 1.0
+    for v in nums:
+        result *= v
+    return result
+
+
+# Register overrides at import time. These survive across multiple
+# formulas.Parser() instances because get_functions() returns the
+# library's global FUNCTIONS dict.
+_excel_aggregates = {
+    "AVERAGE": _excel_average,
+    "SUM": _excel_sum,
+    "MIN": _excel_min,
+    "MAX": _excel_max,
+    "COUNT": _excel_count,
+    "COUNTA": _excel_counta,
+    "PRODUCT": _excel_product,
+}
+for _name, _fn in _excel_aggregates.items():
+    formulas.get_functions()[_name] = _fn
+
+
 # Excel epoch (1900 date system). Excel's serial 1 is 1900-01-01, but because
 # Excel incorrectly treats 1900 as a leap year, we use 1899-12-30 as the epoch
 # so the resulting offsets match Excel for dates >= 1900-03-01 (i.e. all real
