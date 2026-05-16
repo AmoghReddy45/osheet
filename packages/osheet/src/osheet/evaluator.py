@@ -386,9 +386,13 @@ def _scalar(val: Any) -> Any:
 
 
 def _split_top_level_commas(body: str) -> list[str]:
-    """Split a function body at top-level commas, respecting parens and quotes."""
+    """Split a function body at top-level commas, respecting parens, brackets,
+    and quotes. Brackets are tracked so commas inside structured table refs
+    like ``Table[[#Totals],[Col]]`` don't cause spurious splits.
+    """
     parts: list[str] = []
     depth = 0
+    bracket_depth = 0
     in_quote = False
     start = 0
     i = 0
@@ -401,7 +405,11 @@ def _split_top_level_commas(body: str) -> list[str]:
                 depth += 1
             elif ch == ")":
                 depth -= 1
-            elif ch == "," and depth == 0:
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                bracket_depth -= 1
+            elif ch == "," and depth == 0 and bracket_depth == 0:
                 parts.append(body[start:i])
                 start = i + 1
         i += 1
@@ -588,6 +596,65 @@ def _try_if_short_circuit(
             active, default_sheet, value_map, parser, named_tables, cell_row
         ),
     )
+
+
+def _try_iferror_short_circuit(
+    formula: str,
+    default_sheet: str,
+    value_map: dict[str, Any],
+    parser: Any,
+    named_tables: dict[str, Any] | None,
+    cell_row: int,
+) -> tuple[bool, Any]:
+    """If the formula is =IFERROR(expr, fallback), evaluate expr in a try/except.
+    On success, return its value. On any failure (parse, runtime, div-by-zero,
+    unresolvable structured ref, OFFSET out of range, etc), return fallback.
+
+    Returns (handled, value). handled=False means caller should try other paths."""
+    body = formula.lstrip()
+    if body.startswith("="):
+        body = body[1:].lstrip()
+    if not body.upper().startswith("IFERROR("):
+        return (False, None)
+    open_paren = body.upper().find("IFERROR(") + 7
+    close = _find_matching_paren(body, open_paren)
+    if close == -1 or close != len(body.rstrip()) - 1:
+        return (False, None)
+    inner = body[open_paren + 1 : close]
+    parts = _split_top_level_commas(inner)
+    if len(parts) != 2:
+        return (False, None)
+    expr, fallback = (p.strip() for p in parts)
+
+    # Try to evaluate expr via _eval_subexpr_scalar
+    expr_val = _eval_subexpr_scalar(
+        expr, default_sheet, value_map, parser, named_tables, cell_row
+    )
+
+    # Excel-faithful: errors include #DIV/0!, #VALUE!, #REF!, #NAME?, #NUM!, #N/A
+    # In our model, errors manifest as:
+    #   - None (eval raised exception)
+    #   - "#VALUE!", "#DIV/0!", etc. as strings
+    #   - NaN / Inf
+    is_error = False
+    if expr_val is None:
+        is_error = True
+    elif isinstance(expr_val, str) and expr_val.startswith("#") and expr_val.endswith("!"):
+        is_error = True
+    elif isinstance(expr_val, str) and expr_val in (
+        "#N/A", "#NAME?", "#NULL!", "#DIV/0!", "#NUM!", "#REF!", "#VALUE!"
+    ):
+        is_error = True
+    elif isinstance(expr_val, float):
+        if math.isnan(expr_val) or math.isinf(expr_val):
+            is_error = True
+
+    if is_error:
+        fallback_val = _eval_subexpr_scalar(
+            fallback, default_sheet, value_map, parser, named_tables, cell_row
+        )
+        return (True, fallback_val)
+    return (True, expr_val)
 
 
 def _parse_single_cell_ref(ref: str) -> tuple[str | None, str, int]:
@@ -995,8 +1062,15 @@ def _build_dep_graph(
     ensures Tarjan orders OFFSET targets before their consumers — without
     this, an OFFSET target may be evaluated as 0 because its source hasn't
     been computed yet.
+
+    Structured table references (Table[[#Totals],[Col]] etc.) are resolved
+    to their underlying A1 ranges before dependency extraction. Without this,
+    a formula like ``=IFERROR(Tbl[[#Totals],[X]]*0.15,"")`` would be ordered
+    before the totals row it depends on, causing the totals row's "" sentinel
+    to never reach the IFERROR's error branch.
     """
     parser = formulas.Parser()
+    named_tables = getattr(workbook, "named_tables", {}) or {}
 
     # Position lookup: (sheet_name, col, row) -> stable_id
     pos_to_id: dict[tuple[str, int, int], str] = {}
@@ -1020,7 +1094,17 @@ def _build_dep_graph(
         for cell in sheet.cells:
             if not cell.formula:
                 continue
-            refs = _parse_refs(cell.formula, sheet.name)
+            # Resolve structured table refs first so _parse_refs can see the
+            # underlying A1 cells/ranges they target.
+            formula_for_deps = cell.formula
+            if named_tables and "[" in formula_for_deps:
+                try:
+                    formula_for_deps = _resolve_structured_refs(
+                        formula_for_deps, cell.row, named_tables
+                    )
+                except Exception:
+                    formula_for_deps = cell.formula
+            refs = _parse_refs(formula_for_deps, sheet.name)
             dep_ids: set[str] = set()
             for (sname, col, row) in refs:
                 sid = pos_to_id.get((sname, col, row))
@@ -1135,6 +1219,21 @@ def _eval_one_cell(
                     )
                     if handled:
                         return val
+        # Detect outer IFERROR wrapper — handles cases where inner expr fails
+        # to parse (e.g. unresolvable structured refs the formulas library
+        # can't dispatch) or evaluates to an error/None.
+        stripped = formula_text.lstrip("=").lstrip()
+        if stripped.upper().startswith("IFERROR("):
+            handled, val = _try_iferror_short_circuit(
+                formula_text,
+                sheet_name.upper(),
+                value_map,
+                parser,
+                named_tables,
+                cell.row,
+            )
+            if handled:
+                return val
         formula_text = _collapse_redundant_sheet_in_range(formula_text)
         func = parser.ast(formula_text)[1].compile()
         kwargs: dict[str, Any] = {}

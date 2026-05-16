@@ -1220,3 +1220,79 @@ def test_arithmetic_on_accounting_negative_coerces():
     result = evaluate_patch({}, workbook)
     b1 = next(c for c in workbook.all_cells if c.formula)
     assert abs(result[b1.stable_id] - (-1932)) < 0.01
+
+
+def test_iferror_catches_div_by_zero():
+    """=IFERROR(1/0, "no-div") should return "no-div", not error."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '=IFERROR(1/0,"no-div")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[a1.stable_id] == "no-div"
+
+
+def test_iferror_returns_inner_when_no_error():
+    """=IFERROR(5*2, "fallback") should return 10."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '=IFERROR(5*2,"fallback")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[a1.stable_id] == 10.0
+
+
+def test_iferror_catches_unresolvable_table_ref():
+    """=IFERROR(NonExistentTable[[#Totals],[X]] * 0.15, " ") should return " "."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '=IFERROR(NonExistentTable[[#Totals],[X]]*0.15," ")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[a1.stable_id] == " "
+
+
+def test_iferror_returns_empty_string_fallback():
+    """=IFERROR(1/0, "") should return "" (not 0 or None)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '=IFERROR(1/0,"")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[a1.stable_id] == ""
