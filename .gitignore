@@ -12,3 +12,4 @@ node_modules/
 .pytest_cache/
 htmlcov/
 .coverage
+benchmarks/dummy_financial_model.xlsx
