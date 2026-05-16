@@ -202,6 +202,101 @@ def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], pars
     return int(result)
 
 
+def _eval_subexpr_scalar(
+    expr: str,
+    default_sheet: str,
+    value_map: dict[str, Any],
+    parser: Any,
+    named_tables: dict[str, Any] | None,
+    cell_row: int,
+) -> Any:
+    """Evaluate a sub-expression, returning the raw scalar.
+
+    Unlike ``_eval_subexpr`` this does not cast to int and additionally
+    resolves structured table references and OFFSET calls in ``expr``
+    before parsing. Any failure returns ``None``.
+    """
+    try:
+        text = expr
+        if named_tables and "[" in text:
+            text = _resolve_structured_refs(text, cell_row, named_tables)
+        if "OFFSET" in text.upper():
+            text = _resolve_offset_in_formula(text, default_sheet, value_map, parser)
+        if not text.startswith("="):
+            text = "=" + text
+        func = parser.ast(text)[1].compile()
+        kwargs: dict[str, Any] = {}
+        sheet_prefix = default_sheet.upper() + "!"
+        for input_key in func.inputs:
+            normalized = _normalize_input_key(input_key)
+            if ":" in normalized:
+                kwargs[input_key] = _expand_range(normalized, default_sheet.upper(), value_map)
+            else:
+                lookup = normalized if "!" in normalized else sheet_prefix + normalized
+                v = value_map.get(lookup)
+                kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+        return _scalar(func(**kwargs))
+    except Exception:
+        return None
+
+
+def _try_if_short_circuit(
+    formula: str,
+    default_sheet: str,
+    value_map: dict[str, Any],
+    parser: Any,
+    named_tables: dict[str, Any] | None,
+    cell_row: int,
+) -> tuple[bool, Any]:
+    """Short-circuit IF(cond, true, false) when an unresolvable OFFSET sits
+    in the inactive branch.
+
+    Returns ``(handled, value)``. ``handled=True`` means the result is
+    authoritative and the caller should return ``value`` directly.
+    ``handled=False`` means the caller should fall back to normal evaluation.
+    """
+    body = formula.lstrip()
+    if body.startswith("="):
+        body = body[1:].lstrip()
+    if not body.upper().startswith("IF("):
+        return (False, None)
+    open_paren = body.upper().find("IF(") + 2  # index of '('
+    close = _find_matching_paren(body, open_paren)
+    if close == -1 or close != len(body.rstrip()) - 1:
+        return (False, None)
+    inner = body[open_paren + 1 : close]
+    parts = _split_top_level_commas(inner)
+    if len(parts) != 3:
+        return (False, None)
+    cond_expr, true_expr, false_expr = (p.strip() for p in parts)
+    cond_val = _eval_subexpr_scalar(
+        cond_expr, default_sheet, value_map, parser, named_tables, cell_row
+    )
+    if cond_val is None:
+        return (False, None)
+    if cond_val == 0 or cond_val is False or cond_val == "":
+        is_true = False
+    else:
+        is_true = bool(cond_val)
+    active = true_expr if is_true else false_expr
+    active = active.strip()
+    # Recurse into nested IF
+    if active.upper().startswith("IF("):
+        recur_close = _find_matching_paren(active, 2)  # '(' is at index 2
+        if recur_close == len(active) - 1:
+            handled, val = _try_if_short_circuit(
+                "=" + active, default_sheet, value_map, parser, named_tables, cell_row
+            )
+            if handled:
+                return (True, val)
+    return (
+        True,
+        _eval_subexpr_scalar(
+            active, default_sheet, value_map, parser, named_tables, cell_row
+        ),
+    )
+
+
 def _parse_single_cell_ref(ref: str) -> tuple[str | None, str, int]:
     """Parse 'A1' / '$A$1' / 'Sheet!A1' / ''Sheet Name'!A1' into (sheet_or_None, col_letters, row).
     Raises ValueError if not a single-cell reference."""
@@ -433,6 +528,24 @@ def _eval_one_cell(
             formula_text = _resolve_offset_in_formula(
                 formula_text, sheet_name.upper(), value_map, parser
             )
+            # If the rewrite couldn't resolve every OFFSET (e.g. the shifted
+            # column/row would fall out of range) AND the outer wrapper is an
+            # IF, short-circuit the IF and skip the dead branch. Excel never
+            # evaluates that branch, and the unresolved OFFSET would otherwise
+            # cause parse/dispatch failure.
+            if "OFFSET(" in formula_text.upper():
+                stripped = formula_text.lstrip("=").lstrip()
+                if stripped.upper().startswith("IF("):
+                    handled, val = _try_if_short_circuit(
+                        formula_text,
+                        sheet_name.upper(),
+                        value_map,
+                        parser,
+                        named_tables,
+                        cell.row,
+                    )
+                    if handled:
+                        return val
         func = parser.ast(formula_text)[1].compile()
         kwargs: dict[str, Any] = {}
         sheet_prefix = sheet_name.upper() + "!"

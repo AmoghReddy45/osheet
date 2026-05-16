@@ -313,6 +313,98 @@ def test_offset_with_sheet_name():
     assert result[calc.stable_id] == 60
 
 
+# --- IF short-circuit (skip unresolvable OFFSET in dead branch) -------------
+
+
+def test_if_offset_false_branch_short_circuits():
+    """IF condition false -> OFFSET in true branch is skipped -> 99."""
+    data = {
+        "A1": 2,
+        "B1": 7,
+        "C1": "=IF(A1>=5, OFFSET(B1,0,-3), 99)",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    assert result[c1.stable_id] == 99
+
+
+def test_if_offset_true_branch_evaluates():
+    """IF condition true with in-range OFFSET in active branch evaluates correctly."""
+    data = {
+        "A1": 10,
+        "C1": 7,
+        "D1": 99,
+        "E1": "=IF(A1>=5, OFFSET(D1,0,-1), 99)",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    e1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    assert result[e1.stable_id] == 7
+
+
+def test_if_offset_in_else_branch():
+    """IF condition true with unresolvable OFFSET in else branch -> 7."""
+    data = {
+        "A1": 10,
+        "B1": 5,
+        "C1": "=IF(A1>=5, 7, OFFSET(B1,0,-3))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    assert result[c1.stable_id] == 7
+
+
+def test_nested_if_offset_short_circuits():
+    """Nested IFs: outer true, inner never touched (contains unresolvable OFFSET)."""
+    data = {
+        "A1": 10,
+        "A2": 2,
+        "B1": 3,
+        "C1": "=IF(A1>=5, 42, IF(A2>=5, 99, OFFSET(B1,0,-9)))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    assert result[c1.stable_id] == 42
+
+
+def test_nested_if_offset_short_circuits_descends():
+    """Nested IFs: outer false, inner false, OFFSET active and unresolvable -> None."""
+    data = {
+        "A1": 1,
+        "A2": 2,
+        "B1": 3,
+        "C1": "=IF(A1>=5, 42, IF(A2>=5, 99, OFFSET(B1,0,-9)))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    # OFFSET is in the active branch and unresolvable -> None
+    assert result[c1.stable_id] is None
+
+
+def test_if_offset_reachable_and_in_range():
+    """IF true, OFFSET in active branch is in range and resolves."""
+    data = {
+        "A1": 10,
+        "B1": 100, "C1": 200, "D1": 300, "E1": 400,
+        "F1": "=IF(A1>=5, OFFSET(E1,0,-2), 0)",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    f1 = next(c for c in workbook.all_cells if c.formula and "IF" in (c.formula or ""))
+    # OFFSET(E1, 0, -2) -> C1 = 200
+    assert result[f1.stable_id] == 200
+
+
 # --- Structured-reference (Table[[#This Row],[Col]]) tests ------------------
 
 
