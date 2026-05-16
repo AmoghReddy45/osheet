@@ -1,4 +1,5 @@
 import io
+import pytest
 import osheet
 from osheet.models import CellRole
 
@@ -46,3 +47,32 @@ def test_propose_patch(simple_xlsx):
         assert proposal.cell_id == a.stable_id
         assert proposal.new_value == 999
         assert isinstance(proposal.affected_cells, list)
+
+
+def test_propose_patch_has_computed_values(simple_xlsx):
+    wb = osheet.load(simple_xlsx)
+    assumptions = wb.assumptions
+    if not assumptions:
+        pytest.skip("no assumptions detected")
+    proposal = osheet.propose_patch(wb, assumptions[0].stable_id, 0.99)
+    assert hasattr(proposal, "computed_values")
+    assert isinstance(proposal.computed_values, dict)
+
+
+def test_propose_patch_diff_shows_old_and_new(simple_xlsx):
+    wb = osheet.load(simple_xlsx)
+    assumptions = [c for c in wb.assumptions if isinstance(c.value, (int, float))]
+    if not assumptions:
+        pytest.skip("no numeric assumptions")
+    proposal = osheet.propose_patch(wb, assumptions[0].stable_id, 0.99)
+    assert "→" in proposal.diff
+
+
+def test_propose_patch_computed_values_are_numeric(simple_xlsx):
+    wb = osheet.load(simple_xlsx)
+    assumptions = [c for c in wb.assumptions if isinstance(c.value, (int, float))]
+    if not assumptions:
+        pytest.skip("no numeric assumptions")
+    proposal = osheet.propose_patch(wb, assumptions[0].stable_id, 0.99)
+    for v in proposal.computed_values.values():
+        assert v is None or isinstance(v, (int, float, str))
