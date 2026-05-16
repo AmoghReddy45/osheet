@@ -18,9 +18,18 @@ def _is_numeric_format(fmt: str | None) -> bool:
     return any(ch in fmt for ch in "#0%")
 
 
-def _maybe_coerce_value(value, number_format: str | None):
+def _maybe_coerce_value(value, number_format: str | None, data_type: str | None = None):
     """If value is a string that parses as a number and the cell format is numeric,
-    return the float; otherwise return value unchanged."""
+    return the float; otherwise return value unchanged.
+
+    If ``data_type`` is ``'s'`` (shared string) or ``'str'`` (inline string),
+    Excel stored the value as TEXT — we leave it as-is so that aggregate
+    functions (AVERAGE/SUM/etc) correctly skip these cells, matching Excel's
+    text-skipping semantics.
+    """
+    if data_type in ("s", "str"):
+        # Excel-stored text — preserve type even if the format is numeric.
+        return value
     if not isinstance(value, str):
         return value
     if not _is_numeric_format(number_format):
@@ -83,7 +92,11 @@ def parse_xlsx(data: bytes) -> Workbook:
                 else:
                     # Coerce numeric-formatted text (e.g. "3,827", "(2,032)") to float
                     # so direct cell references propagate numbers, not strings.
-                    value = _maybe_coerce_value(value, ox_cell.number_format)
+                    # Excel-stored text-typed cells (data_type 's' or 'str') are
+                    # preserved as strings so AVERAGE/SUM correctly skip them.
+                    value = _maybe_coerce_value(
+                        value, ox_cell.number_format, ox_cell.data_type
+                    )
 
                 cells.append(Cell(
                     stable_id=f"{ws.title}.{ox_cell.column_letter}{ox_cell.row}",
