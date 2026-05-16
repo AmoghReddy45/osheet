@@ -63,6 +63,15 @@ class Sheet(BaseModel):
     cells: list[Cell] = Field(default_factory=list)
 
 
+class NamedTable(BaseModel):
+    name: str
+    sheet_name: str
+    ref: str                      # e.g. "A1:G25"
+    header_row: int               # first row of ref (where column names live)
+    first_col: int                # left column index (1-based)
+    columns: dict[str, int] = Field(default_factory=dict)  # col_name -> absolute col index (1-based)
+
+
 class Warning(BaseModel):
     address: str
     message: str
@@ -81,6 +90,7 @@ class Manifest(BaseModel):
 class Workbook(BaseModel):
     sheets: list[Sheet]
     manifest: Manifest = Field(default_factory=Manifest)
+    named_tables: dict[str, NamedTable] = Field(default_factory=dict)
 
     @property
     def assumptions(self) -> list[Cell]:

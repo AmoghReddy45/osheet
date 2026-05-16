@@ -300,6 +300,40 @@ def _resolve_offset_in_formula(
         return formula
 
 
+# Structured-reference pattern: TableName[[#This Row],[ColName]]
+_STRUCTURED_REF_RE = re.compile(
+    r"([A-Za-z_][\w]*)"             # table name
+    r"\[\["                          # [[
+    r"#This Row\],\["                # #This Row],[
+    r"([^\]]+)"                      # column name (no ])
+    r"\]\]"                          # ]]
+)
+
+
+def _resolve_structured_refs(
+    formula: str,
+    cell_row: int,
+    named_tables: dict[str, Any],
+) -> str:
+    """Rewrite TableName[[#This Row],[ColName]] -> 'Sheet'!COLROW.
+    Returns formula unchanged if no rewrite possible."""
+    if not named_tables or "[" not in formula:
+        return formula
+
+    def _sub(m: re.Match) -> str:
+        tname, col_name = m.group(1), m.group(2)
+        tbl = named_tables.get(tname)
+        if tbl is None or col_name not in tbl.columns:
+            return m.group(0)  # leave unchanged -> formula will fail with None
+        col = tbl.columns[col_name]
+        addr = f"{get_column_letter(col)}{cell_row}"
+        sheet = tbl.sheet_name
+        prefix = f"'{sheet}'!" if " " in sheet or "'" in sheet else f"{sheet}!"
+        return f"{prefix}{addr}"
+
+    return _STRUCTURED_REF_RE.sub(_sub, formula)
+
+
 def _build_dep_graph(
     workbook: Workbook,
 ) -> dict[str, set[str]]:
@@ -388,10 +422,13 @@ def _eval_one_cell(
     value_map: dict[str, Any],
     id_to_key: dict[str, str],
     parser: Any,
+    named_tables: dict[str, Any] | None = None,
 ) -> Any:
     """Evaluate a single formula cell. Returns scalar or None on error."""
     try:
         formula_text = cell.formula
+        if named_tables and "[" in formula_text:
+            formula_text = _resolve_structured_refs(formula_text, cell.row, named_tables)
         if "OFFSET" in formula_text.upper():
             formula_text = _resolve_offset_in_formula(
                 formula_text, sheet_name.upper(), value_map, parser
@@ -419,6 +456,7 @@ def _gauss_seidel(
     parser: Any,
     max_iterations: int = 50,
     tolerance: float = 1e-6,
+    named_tables: dict[str, Any] | None = None,
 ) -> None:
     """Iterate circular SCC in-place (Gauss-Seidel) until convergence.
     Modifies value_map in place. Silent on non-convergence."""
@@ -436,7 +474,7 @@ def _gauss_seidel(
         for sheet_name, cell in scc_cells:
             k = id_to_key[cell.stable_id]
             old_val = value_map.get(k)
-            new_val = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser)
+            new_val = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser, named_tables)
             if new_val is None:
                 continue
             # Apply under-relaxation if oscillation was detected
@@ -469,6 +507,7 @@ def evaluate_patch(
     circular references.
     """
     parser = formulas.Parser()
+    named_tables = getattr(workbook, "named_tables", {}) or {}
 
     # Build value map and bidirectional key mappings
     value_map: dict[str, Any] = {}
@@ -511,12 +550,12 @@ def evaluate_patch(
 
         if is_circular:
             scc_cells = [cell_lookup[sid] for sid in formula_nodes]
-            _gauss_seidel(scc_cells, value_map, id_to_key, parser)
+            _gauss_seidel(scc_cells, value_map, id_to_key, parser, named_tables=named_tables)
         else:
             # Non-circular singleton: evaluate once
             sid = formula_nodes[0]
             sheet_name, cell = cell_lookup[sid]
-            result = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser)
+            result = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser, named_tables)
             value_map[id_to_key[sid]] = result
 
     return {

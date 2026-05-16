@@ -311,3 +311,72 @@ def test_offset_with_sheet_name():
     result = evaluate_patch({}, workbook)
     calc = next(c for c in workbook.all_cells if c.formula and "SUM" in c.formula)
     assert result[calc.stable_id] == 60
+
+
+# --- Structured-reference (Table[[#This Row],[Col]]) tests ------------------
+
+
+def test_structured_ref_this_row_resolves():
+    """=MyTbl[[#This Row],[B_col]]+1 at C2 -> B2+1 = 11."""
+    from openpyxl.worksheet.table import Table, TableColumn
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'], ws['B1'] = 'A_col', 'B_col'
+    ws['A2'], ws['B2'] = 1, 10
+    ws['A3'], ws['B3'] = 2, 20
+    ws['C2'] = "=MyTbl[[#This Row],[B_col]]+1"
+    tbl = Table(displayName='MyTbl', name='MyTbl', ref='A1:B3', tableColumns=[
+        TableColumn(id=1, name='A_col'),
+        TableColumn(id=2, name='B_col'),
+    ])
+    ws.add_table(tbl)
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c2 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[c2.stable_id] == 11
+
+
+def test_structured_ref_unknown_table_returns_none():
+    """Reference to undefined table -> result is None, no crash."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 5
+    ws['B1'] = "=NoSuchTable[[#This Row],[NoCol]]+1"
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] is None
+
+
+def test_structured_ref_cross_sheet():
+    """Table on Sheet1, formula on Sheet2 references the table."""
+    from openpyxl.worksheet.table import Table, TableColumn
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Data Sheet"
+    ws1['A1'], ws1['B1'] = 'A_col', 'B_col'
+    ws1['A2'], ws1['B2'] = 1, 100
+    ws1['A3'], ws1['B3'] = 2, 200
+    tbl = Table(displayName='CrossTbl', name='CrossTbl', ref='A1:B3', tableColumns=[
+        TableColumn(id=1, name='A_col'),
+        TableColumn(id=2, name='B_col'),
+    ])
+    ws1.add_table(tbl)
+    ws2 = wb.create_sheet("Calc")
+    # Formula at C2 referencing #This Row -> row 2 of Data Sheet -> B2 = 100
+    ws2['C2'] = "=CrossTbl[[#This Row],[B_col]]*2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c2 = next(c for c in workbook.all_cells if c.formula and "CrossTbl" in c.formula)
+    assert result[c2.stable_id] == 200

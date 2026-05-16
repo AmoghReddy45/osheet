@@ -2,7 +2,8 @@ from __future__ import annotations
 import io
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell as OxlCell
-from osheet.models import Cell, CellRole, Sheet, Workbook, Manifest
+from openpyxl.utils import column_index_from_string
+from osheet.models import Cell, CellRole, NamedTable, Sheet, Workbook, Manifest
 
 
 def _fill_color(cell: OxlCell) -> str | None:
@@ -51,5 +52,31 @@ def parse_xlsx(data: bytes) -> Workbook:
             cells=cells,
         ))
 
+    # Collect Excel named tables (structured-reference targets) from each worksheet.
+    named_tables: dict[str, NamedTable] = {}
+    for ws in wb_ox.worksheets:
+        for tname in ws.tables:
+            tbl = ws.tables[tname]
+            if isinstance(tbl, str):
+                continue  # Skip legacy str-only entries (no column metadata)
+            try:
+                start_addr, _end_addr = tbl.ref.split(":")
+                start_col_letters = "".join(c for c in start_addr if c.isalpha())
+                start_row = int("".join(c for c in start_addr if c.isdigit()))
+                first_col = column_index_from_string(start_col_letters)
+            except Exception:
+                continue
+            cols: dict[str, int] = {}
+            for i, col_def in enumerate(tbl.tableColumns or []):
+                cols[col_def.name] = first_col + i
+            named_tables[tname] = NamedTable(
+                name=tname,
+                sheet_name=ws.title,
+                ref=tbl.ref,
+                header_row=start_row,
+                first_col=first_col,
+                columns=cols,
+            )
+
     manifest = Manifest(source_file="", sheet_count=len(sheets))
-    return Workbook(sheets=sheets, manifest=manifest)
+    return Workbook(sheets=sheets, manifest=manifest, named_tables=named_tables)
