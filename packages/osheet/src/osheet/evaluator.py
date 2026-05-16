@@ -34,7 +34,7 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
     vals = []
     for row in range(min(r1, r2), max(r1, r2) + 1):
         for col in range(min(c1, c2), max(c1, c2) + 1):
-            v = value_map.get(f"{sheet}!{get_column_letter(col)}{row}", np.nan)
+            v = value_map.get(f"{sheet.upper()}!{get_column_letter(col)}{row}", np.nan)
             vals.append(_to_float(v))
     return np.array([vals])
 
@@ -122,6 +122,7 @@ def evaluate_patch(
     Apply {stable_id: new_value} patches and re-evaluate all formula cells.
 
     Returns {stable_id: computed_value} for every cell in the workbook.
+    workbook is not mutated — call evaluate_patch again to re-evaluate from scratch.
     Formula evaluation is in topological order derived from formula references.
     """
     parser = formulas.Parser()
@@ -177,8 +178,10 @@ def evaluate_patch(
             else:
                 next_round.append((sheet_name, cell))
         if len(next_round) == len(remaining):
-            # cycle or unresolvable — process remaining as-is
-            ordered.extend(next_round)
+            # Genuine cycle — mark all cyclic cells as None, skip evaluation
+            for sheet_name, cell in next_round:
+                value_map[id_to_key[cell.stable_id]] = None
+                resolved.add(cell.stable_id)
             break
         remaining = next_round
 
@@ -207,7 +210,7 @@ def evaluate_patch(
             result = _scalar(func(**kwargs))
             value_map[id_to_key[cell.stable_id]] = result
         except Exception:
-            pass  # leave at current value on parse/eval failure
+            value_map[id_to_key[cell.stable_id]] = None
 
     return {
         key_to_id[k]: _scalar(v)

@@ -73,3 +73,19 @@ def test_evaluate_sum_propagates(two_sheet_bytes):
     # Total = Year1 + Year2 = 120000 + 144000 = 264000
     total = next(c for c in workbook.all_cells if c.formula and "SUM" in c.formula)
     assert abs(result[total.stable_id] - 264_000) < 1
+
+
+def test_evaluate_bad_formula_returns_none(two_sheet_bytes):
+    """Cells with unparseable formulas should return None, not the stale value."""
+    workbook = parse_xlsx(two_sheet_bytes)
+    run_all(workbook)
+    # Find a real formula cell and inject a bad formula
+    formula_cell = next(c for c in workbook.all_cells if c.formula)
+    original_formula = formula_cell.formula
+    formula_cell.formula = "=)BROKEN("
+    formula_cell.value = 99999  # stale value before bad formula
+    result = evaluate_patch({}, workbook)
+    # Restore
+    formula_cell.formula = original_formula
+    # Should return None for failed formula, not the stale 99999
+    assert result[formula_cell.stable_id] is None
