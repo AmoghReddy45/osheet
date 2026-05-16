@@ -123,6 +123,101 @@ def _excel_product(*args):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Excel-faithful blank/text overrides.
+#
+# The `formulas` library coerces None inputs to 0 before our overrides see
+# them, which yields non-Excel results:
+#   ISBLANK(<empty>) → False        (Excel: True)
+#   UPPER(<empty>)   → "0"          (Excel: "")
+#   LOWER(<empty>)   → "0"          (Excel: "")
+#
+# Solution: pass a `_Blank` sentinel for None/empty cells at the call site.
+# `_Blank` is a `float` subclass (== 0.0) so arithmetic still works
+# (=A1+5 with blank A1 → 5), but our UPPER/ISBLANK/LOWER overrides can
+# detect it via `isinstance(x, _Blank)` and return Excel-faithful results.
+# ---------------------------------------------------------------------------
+
+
+class _Blank(float):
+    """Sentinel for Excel-blank cells. Behaves as 0.0 numerically; detectable
+    by ISBLANK/UPPER/LOWER via isinstance check."""
+    __slots__ = ()
+    _instance: "_Blank | None" = None
+
+    def __new__(cls) -> "_Blank":
+        if cls._instance is None:
+            cls._instance = float.__new__(cls, 0.0)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover — debugging only
+        return "BLANK"
+
+
+_BLANK = _Blank()
+
+
+def _unwrap_arg(a):
+    """Pull a scalar out of a 1-element numpy array; pass other values through."""
+    if isinstance(a, np.ndarray) and a.size == 1:
+        return a.flat[0]
+    return a
+
+
+def _is_blank_value(a) -> bool:
+    """True if a should be treated as Excel-blank for text-context functions."""
+    if isinstance(a, _Blank):
+        return True
+    if a is None:
+        return True
+    if isinstance(a, str) and a == "":
+        return True
+    if isinstance(a, float) and math.isnan(a):
+        return True
+    return False
+
+
+def _excel_isblank(*args):
+    """ISBLANK(cell) → True only if cell is empty (None / "" / NaN / _Blank)."""
+    if not args:
+        return False
+    return _is_blank_value(_unwrap_arg(args[0]))
+
+
+def _stringify_for_excel_text(a):
+    """Excel-style scalar → string. Blank/None/NaN → ''. Integral floats → '<int>'."""
+    if _is_blank_value(a):
+        return ""
+    if isinstance(a, bool):
+        return "TRUE" if a else "FALSE"
+    if isinstance(a, float):
+        if a.is_integer():
+            return str(int(a))
+        return str(a)
+    if isinstance(a, (int, np.integer)):
+        return str(int(a))
+    if isinstance(a, np.floating):
+        fv = float(a)
+        if fv.is_integer():
+            return str(int(fv))
+        return str(fv)
+    return str(a)
+
+
+def _excel_upper(*args):
+    """UPPER(text) → uppercase. Blank/None/empty → ''."""
+    if not args:
+        return ""
+    return _stringify_for_excel_text(_unwrap_arg(args[0])).upper()
+
+
+def _excel_lower(*args):
+    """LOWER(text) → lowercase. Blank/None/empty → ''."""
+    if not args:
+        return ""
+    return _stringify_for_excel_text(_unwrap_arg(args[0])).lower()
+
+
 # Register overrides at import time. These survive across multiple
 # formulas.Parser() instances because get_functions() returns the
 # library's global FUNCTIONS dict.
@@ -134,6 +229,9 @@ _excel_aggregates = {
     "COUNT": _excel_count,
     "COUNTA": _excel_counta,
     "PRODUCT": _excel_product,
+    "ISBLANK": _excel_isblank,
+    "UPPER": _excel_upper,
+    "LOWER": _excel_lower,
 }
 for _name, _fn in _excel_aggregates.items():
     formulas.get_functions()[_name] = _fn
@@ -331,7 +429,10 @@ def _coerce_string_to_float(s: str) -> float:
 
 def _to_float(val: Any) -> float:
     if val is None:
-        return 0.0  # Excel treats empty/missing cells as 0 in arithmetic
+        # Excel treats empty/missing cells as 0 in arithmetic. We return a
+        # _Blank sentinel (==0.0 numerically) so that text-context functions
+        # like UPPER/LOWER/ISBLANK can still detect blankness downstream.
+        return _BLANK
     if isinstance(val, (datetime, date, time)):
         # Dates pass through formula evaluation as Excel serial numbers so that
         # YEAR/EDATE/EOMONTH/TEXT/etc. (which the formulas lib implements

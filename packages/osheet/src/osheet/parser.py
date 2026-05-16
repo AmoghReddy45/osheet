@@ -4,6 +4,7 @@ from datetime import datetime as _dt
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell as OxlCell
 from openpyxl.utils import column_index_from_string
+from openpyxl.worksheet.formula import ArrayFormula
 from osheet.models import Cell, CellRole, NamedTable, Sheet, Workbook, Manifest
 
 
@@ -75,9 +76,16 @@ def _fill_color(cell: OxlCell) -> str | None:
 
 def parse_xlsx(data: bytes) -> Workbook:
     wb_ox = load_workbook(io.BytesIO(data), data_only=False)
+    # Also load the cached/data-only view so we can recover scalars for
+    # ArrayFormula cells. openpyxl returns an ArrayFormula object for cells
+    # inside a CSE-style array formula and doesn't compute their values;
+    # without unwrapping, downstream references like ``=D118`` receive the
+    # opaque object instead of the scalar Excel cached there.
+    wb_cached = load_workbook(io.BytesIO(data), data_only=True)
     sheets: list[Sheet] = []
 
     for ws in wb_ox.worksheets:
+        cached_ws = wb_cached[ws.title]
         cells: list[Cell] = []
         for row in ws.iter_rows():
             for ox_cell in row:
@@ -85,6 +93,20 @@ def parse_xlsx(data: bytes) -> Workbook:
                     continue
                 raw_val = ox_cell.value
                 formula: str | None = None
+
+                if isinstance(raw_val, ArrayFormula):
+                    # Substitute Excel's cached scalar so dependents resolve to
+                    # a real number instead of an opaque ArrayFormula instance.
+                    # If there is no cache (rare — file saved without values),
+                    # fall through with None and the cell becomes a constant 0
+                    # for arithmetic, matching Excel-blank behavior.
+                    cached_val = cached_ws.cell(
+                        row=ox_cell.row, column=ox_cell.column
+                    ).value
+                    if cached_val is None:
+                        continue  # treat as blank — nothing to record
+                    raw_val = cached_val
+
                 value = raw_val
                 if isinstance(raw_val, str) and raw_val.startswith("="):
                     formula = raw_val

@@ -1296,3 +1296,155 @@ def test_iferror_returns_empty_string_fallback():
     result = evaluate_patch({}, workbook)
     a1 = next(c for c in workbook.all_cells if c.formula)
     assert result[a1.stable_id] == ""
+
+
+def test_isblank_returns_true_for_empty_cell():
+    """ISBLANK on a truly empty cell should return TRUE (Excel-faithful)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    # A1 is intentionally unset → blank.
+    ws['B1'] = "=ISBLANK(A1)"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] is True
+
+
+def test_isblank_returns_false_for_zero():
+    """ISBLANK(cell_with_zero) → FALSE — 0 is not blank in Excel."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 0
+    ws['B1'] = "=ISBLANK(A1)"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] is False
+
+
+def test_upper_on_empty_cell_returns_empty_string():
+    """UPPER(blank) → "" — must not coerce blank to "0"."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['B1'] = "=UPPER(A1)"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == ""
+
+
+def test_upper_string_concat_with_blank_branch():
+    """Mirror of runway_budget readme.b2 pattern:
+        =UPPER(A1)&" "&IF(ISBLANK(B1),"","FOR "&UPPER(B1))
+    where B1 is blank → expect "HELLO " (trailing space, no "FOR 0").
+    """
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = "hello"
+    # B1 deliberately unset
+    ws['C1'] = '=UPPER(A1)&" "&IF(ISBLANK(B1),"","FOR "&UPPER(B1))'
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[c1.stable_id] == "HELLO "
+
+
+def test_upper_on_numeric_cell_returns_number_string():
+    """UPPER(123) → "123" (Excel coerces numbers to text)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 123
+    ws['B1'] = "=UPPER(A1)"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == "123"
+
+
+def test_lower_on_empty_cell_returns_empty_string():
+    """LOWER(blank) → "" — companion to UPPER fix."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['B1'] = "=LOWER(A1)"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == ""
+
+
+def test_blank_cell_arithmetic_still_works():
+    """Regression: =A1+5 where A1 is blank should still return 5
+    (Excel treats blank as 0 in arithmetic context)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    # A1 unset
+    ws['B1'] = "=A1+5"
+    buf = io.BytesIO(); wb.save(buf)
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == 5.0
+
+
+def test_array_formula_cells_use_cached_value_not_object():
+    """Parser must unwrap openpyxl ArrayFormula objects so dependents like
+    =D118 see a scalar, not an opaque ArrayFormula instance."""
+    from osheet.parser import parse_xlsx
+    with open(
+        '/Users/amoghreddy/excel-project/benchmarks/real_models/runway_budget_model.xlsx',
+        'rb',
+    ) as f:
+        wb = parse_xlsx(f.read())
+    for c in wb.all_cells:
+        # No cell should still carry an ArrayFormula object as its value.
+        assert 'ArrayFormula' not in type(c.value).__name__, (
+            f"Cell {c.stable_id} still has ArrayFormula in value: {c.value!r}"
+        )
