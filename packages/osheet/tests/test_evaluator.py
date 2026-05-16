@@ -472,3 +472,169 @@ def test_structured_ref_cross_sheet():
     result = evaluate_patch({}, workbook)
     c2 = next(c for c in workbook.all_cells if c.formula and "CrossTbl" in c.formula)
     assert result[c2.stable_id] == 200
+
+
+# --- Whole-column / totals / headers structured-reference tests -------------
+
+
+def _whole_col_workbook(formula: str, *, totals: bool = False) -> bytes:
+    """Helper: 3 data rows (Code, Amount). Optionally with totals row."""
+    from openpyxl.worksheet.table import Table, TableColumn
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws['A1'], ws['B1'] = 'Code', 'Amount'
+    ws['A2'], ws['B2'] = 'X', 10
+    ws['A3'], ws['B3'] = 'Y', 20
+    ws['A4'], ws['B4'] = 'X', 30
+    if totals:
+        ws['A5'], ws['B5'] = 'Total', 60
+        ref = 'A1:B5'
+        tbl_kwargs = {'totalsRowCount': 1}
+    else:
+        ref = 'A1:B4'
+        tbl_kwargs = {}
+    ws['D1'] = formula
+    tbl = Table(
+        displayName='MyTbl', name='MyTbl', ref=ref,
+        tableColumns=[
+            TableColumn(id=1, name='Code'),
+            TableColumn(id=2, name='Amount'),
+        ],
+        **tbl_kwargs,
+    )
+    ws.add_table(tbl)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_structured_ref_whole_column_in_sum():
+    """=SUM(MyTbl[Amount]) over [10,20,30] -> 60."""
+    workbook = parse_xlsx(_whole_col_workbook("=SUM(MyTbl[Amount])"))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[d1.stable_id] == 60
+
+
+def test_structured_ref_whole_column_in_sumif():
+    """=SUMIF(MyTbl[Code], "X", MyTbl[Amount]) -> 10+30 = 40."""
+    workbook = parse_xlsx(_whole_col_workbook('=SUMIF(MyTbl[Code], "X", MyTbl[Amount])'))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[d1.stable_id] == 40
+
+
+def test_structured_ref_totals_row_single_col():
+    """=MyTbl[[#Totals],[Amount]] -> 60 (the totals row value)."""
+    workbook = parse_xlsx(_whole_col_workbook("=MyTbl[[#Totals],[Amount]]", totals=True))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[d1.stable_id] == 60
+
+
+def test_structured_ref_totals_excludes_totals_row_from_data():
+    """=SUM(MyTbl[Amount]) on table with totals row sums data only (10+20+30=60)."""
+    workbook = parse_xlsx(_whole_col_workbook("=SUM(MyTbl[Amount])", totals=True))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    # If totals row were included, sum would be 120 instead.
+    assert result[d1.stable_id] == 60
+
+
+def test_structured_ref_no_totals_row_totals_ref_is_none():
+    """=MyTbl[[#Totals],[Amount]] without a totals row -> None (unrewritable)."""
+    workbook = parse_xlsx(_whole_col_workbook("=MyTbl[[#Totals],[Amount]]", totals=False))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[d1.stable_id] is None
+
+
+def test_structured_ref_column_range():
+    """=SUM(MyTbl[[Jan]:[Mar]]) over 2D area -> sum of all values."""
+    from openpyxl.worksheet.table import Table, TableColumn
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws['A1'], ws['B1'], ws['C1'] = 'Jan', 'Feb', 'Mar'
+    ws['A2'], ws['B2'], ws['C2'] = 1, 2, 3
+    ws['A3'], ws['B3'], ws['C3'] = 4, 5, 6
+    ws['E1'] = "=SUM(MyTbl[[Jan]:[Mar]])"
+    tbl = Table(displayName='MyTbl', name='MyTbl', ref='A1:C3', tableColumns=[
+        TableColumn(id=1, name='Jan'),
+        TableColumn(id=2, name='Feb'),
+        TableColumn(id=3, name='Mar'),
+    ])
+    ws.add_table(tbl)
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    e1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[e1.stable_id] == 21  # 1+2+3+4+5+6
+
+
+def test_structured_ref_headers_single_col():
+    """=MyTbl[[#Headers],[Amount]] -> 'Amount' (the header label)."""
+    workbook = parse_xlsx(_whole_col_workbook("=MyTbl[[#Headers],[Amount]]"))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[d1.stable_id] == "Amount"
+
+
+def test_structured_ref_iferror_wraps_table_ref():
+    """=IFERROR(SUM(MyTbl[Amount])/COUNTA(MyTbl[Amount]),0) -> mean = 60/3 = 20."""
+    workbook = parse_xlsx(
+        _whole_col_workbook("=IFERROR(SUM(MyTbl[Amount])/COUNTA(MyTbl[Amount]),0)")
+    )
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    d1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert abs(result[d1.stable_id] - 20.0) < 1e-9
+
+
+def test_structured_ref_subtotal_109_whole_column():
+    """=SUBTOTAL(109, MyTbl[TOTAL COST]) -> sum of the column."""
+    from openpyxl.worksheet.table import Table, TableColumn
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws['A1'] = 'TOTAL COST'
+    ws['A2'] = 100
+    ws['A3'] = 200
+    ws['A4'] = 300
+    ws['C1'] = "=SUBTOTAL(109, MyTbl[TOTAL COST])"
+    tbl = Table(displayName='MyTbl', name='MyTbl', ref='A1:A4', tableColumns=[
+        TableColumn(id=1, name='TOTAL COST'),
+    ])
+    ws.add_table(tbl)
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "MyTbl" in c.formula)
+    assert result[c1.stable_id] == 600
+
+
+def test_structured_ref_bare_brackets_with_unknown_table_unchanged():
+    """Bare [X] with no matching table -> None (no crash)."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = 5
+    ws['B1'] = "=NoSuchTbl[X]+1"
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] is None

@@ -60,12 +60,19 @@ def parse_xlsx(data: bytes) -> Workbook:
             if isinstance(tbl, str):
                 continue  # Skip legacy str-only entries (no column metadata)
             try:
-                start_addr, _end_addr = tbl.ref.split(":")
+                start_addr, end_addr = tbl.ref.split(":")
                 start_col_letters = "".join(c for c in start_addr if c.isalpha())
                 start_row = int("".join(c for c in start_addr if c.isdigit()))
                 first_col = column_index_from_string(start_col_letters)
+                end_col_letters = "".join(c for c in end_addr if c.isalpha())
+                end_row = int("".join(c for c in end_addr if c.isdigit()))
+                last_col = column_index_from_string(end_col_letters)
             except Exception:
                 continue
+            has_totals = bool(getattr(tbl, "totalsRowCount", 0) or 0)
+            header_rows = getattr(tbl, "headerRowCount", 1) or 1
+            first_data_row = start_row + header_rows
+            last_data_row = end_row - (1 if has_totals else 0)
             cols: dict[str, int] = {}
             for i, col_def in enumerate(tbl.tableColumns or []):
                 cols[col_def.name] = first_col + i
@@ -75,6 +82,10 @@ def parse_xlsx(data: bytes) -> Workbook:
                 ref=tbl.ref,
                 header_row=start_row,
                 first_col=first_col,
+                last_col=last_col,
+                first_data_row=first_data_row,
+                last_data_row=last_data_row,
+                has_totals_row=has_totals,
                 columns=cols,
             )
 

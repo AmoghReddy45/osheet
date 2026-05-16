@@ -69,6 +69,10 @@ class NamedTable(BaseModel):
     ref: str                      # e.g. "A1:G25"
     header_row: int               # first row of ref (where column names live)
     first_col: int                # left column index (1-based)
+    last_col: int = 0             # right column index (1-based)
+    first_data_row: int = 0       # header_row + 1 typically
+    last_data_row: int = 0        # bottom of ref minus totals row
+    has_totals_row: bool = False
     columns: dict[str, int] = Field(default_factory=dict)  # col_name -> absolute col index (1-based)
 
 

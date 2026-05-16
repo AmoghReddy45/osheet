@@ -40,7 +40,10 @@ def _normalize_input_key(input_key: str) -> str:
 
 
 def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any]) -> np.ndarray:
-    """Turn 'B2:B13' or 'SHEET!B2:SHEET!B13' into a numpy row array for SUM etc."""
+    """Turn 'B2:B13' or 'SHEET!B2:SHEET!B13' into a numpy row array for SUM etc.
+
+    Preserves string values (uses an object dtype) so that text-criteria
+    aggregations such as SUMIF can match labels in the criteria range."""
     # Strip quotes from sheet name portion if present (e.g. 'FIXED ASSETS'!B2:B13)
     range_key = _normalize_input_key(range_key)
     if "!" in range_key:
@@ -58,10 +61,19 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
     r2 = int("".join(c for c in end_cell if c.isdigit()))
 
     vals = []
+    has_text = False
     for row in range(min(r1, r2), max(r1, r2) + 1):
         for col in range(min(c1, c2), max(c1, c2) + 1):
-            v = value_map.get(f"{sheet.upper()}!{get_column_letter(col)}{row}", np.nan)
-            vals.append(_to_float(v))
+            v = value_map.get(f"{sheet.upper()}!{get_column_letter(col)}{row}")
+            if isinstance(v, str):
+                has_text = True
+                vals.append(v)
+            elif v is None:
+                vals.append(0.0)  # Excel treats blanks as 0 in numeric contexts
+            else:
+                vals.append(_to_float(v))
+    if has_text:
+        return np.array([vals], dtype=object)
     return np.array([vals])
 
 
@@ -220,6 +232,8 @@ def _eval_subexpr_scalar(
         text = expr
         if named_tables and "[" in text:
             text = _resolve_structured_refs(text, cell_row, named_tables)
+        if "SUBTOTAL(" in text.upper():
+            text = _rewrite_subtotal(text)
         if "OFFSET" in text.upper():
             text = _resolve_offset_in_formula(text, default_sheet, value_map, parser)
         if not text.startswith("="):
@@ -395,14 +409,97 @@ def _resolve_offset_in_formula(
         return formula
 
 
-# Structured-reference pattern: TableName[[#This Row],[ColName]]
+# Structured-reference pattern. Order of alternatives matters - longer/more
+# specific patterns come first so the regex engine prefers them.
 _STRUCTURED_REF_RE = re.compile(
-    r"([A-Za-z_][\w]*)"             # table name
-    r"\[\["                          # [[
-    r"#This Row\],\["                # #This Row],[
-    r"([^\]]+)"                      # column name (no ])
-    r"\]\]"                          # ]]
+    r"\b([A-Za-z_]\w*)"
+    r"(?:"
+    r"\[\[\#This\sRow\],\[([^\]]+)\]:\[([^\]]+)\]\]"   # groups 2,3: #This Row col range
+    r"|\[\[\#This\sRow\],\[([^\]]+)\]\]"               # group 4: #This Row, single col
+    r"|\[\[\#Totals\],\[([^\]]+)\]:\[([^\]]+)\]\]"     # groups 5,6: #Totals col range
+    r"|\[\[\#Totals\],\[([^\]]+)\]\]"                  # group 7: #Totals single col
+    r"|\[\[\#Headers\],\[([^\]]+)\]\]"                 # group 8: #Headers single col
+    r"|\[\[([^\]\#][^\]]*)\]:\[([^\]]+)\]\]"           # groups 9,10: col range [[A]:[B]]
+    r"|\[\#All\]"
+    r"|\[\#Data\]"
+    r"|\[\#Headers\]"
+    r"|\[\#Totals\]"
+    r"|\[([^\]\#\[][^\]]*)\]"                          # group 11: bare [Col]
+    r")"
 )
+
+
+def _sheet_prefix(sheet_name: str) -> str:
+    return f"'{sheet_name}'!" if " " in sheet_name or "'" in sheet_name else f"{sheet_name}!"
+
+
+# SUBTOTAL function-code -> plain aggregate function name. The 1xx codes ignore
+# hidden rows; without UI state we treat both code ranges identically.
+_SUBTOTAL_FN_BY_CODE = {
+    1: "AVERAGE", 101: "AVERAGE",
+    2: "COUNT", 102: "COUNT",
+    3: "COUNTA", 103: "COUNTA",
+    4: "MAX", 104: "MAX",
+    5: "MIN", 105: "MIN",
+    6: "PRODUCT", 106: "PRODUCT",
+    7: "STDEV", 107: "STDEV",
+    8: "STDEVP", 108: "STDEVP",
+    9: "SUM", 109: "SUM",
+    10: "VAR", 110: "VAR",
+    11: "VARP", 111: "VARP",
+}
+
+
+def _rewrite_subtotal(formula: str) -> str:
+    """Rewrite SUBTOTAL(code, args...) -> <AGGREGATE>(args...) so that the
+    formulas library (which does not implement SUBTOTAL) can evaluate it.
+
+    Iterates innermost-first so nested SUBTOTALs are handled correctly."""
+    upper = formula.upper()
+    if "SUBTOTAL(" not in upper:
+        return formula
+    # Repeatedly find innermost SUBTOTAL and rewrite it.
+    current = formula
+    for _ in range(64):
+        upper = current.upper()
+        idx = -1
+        # Find an occurrence of SUBTOTAL( whose body contains no inner SUBTOTAL(
+        search_from = 0
+        while True:
+            pos = upper.find("SUBTOTAL(", search_from)
+            if pos == -1:
+                break
+            if pos > 0 and (current[pos - 1].isalnum() or current[pos - 1] == "_"):
+                search_from = pos + 1
+                continue
+            open_paren = pos + len("SUBTOTAL")
+            close = _find_matching_paren(current, open_paren)
+            if close == -1:
+                return current
+            body = current[open_paren + 1: close]
+            if "SUBTOTAL(" in body.upper():
+                search_from = pos + 1
+                continue
+            idx = pos
+            break
+        if idx == -1:
+            return current
+        open_paren = idx + len("SUBTOTAL")
+        close = _find_matching_paren(current, open_paren)
+        body = current[open_paren + 1: close]
+        args = _split_top_level_commas(body)
+        if not args:
+            return current
+        try:
+            code = int(float(args[0].strip()))
+        except (ValueError, TypeError):
+            return current
+        fn = _SUBTOTAL_FN_BY_CODE.get(code)
+        if fn is None:
+            return current
+        rest = ",".join(args[1:])
+        current = current[:idx] + fn + "(" + rest + ")" + current[close + 1:]
+    return current
 
 
 def _resolve_structured_refs(
@@ -410,21 +507,129 @@ def _resolve_structured_refs(
     cell_row: int,
     named_tables: dict[str, Any],
 ) -> str:
-    """Rewrite TableName[[#This Row],[ColName]] -> 'Sheet'!COLROW.
-    Returns formula unchanged if no rewrite possible."""
+    """Rewrite structured Table references to A1-style ranges.
+
+    Supports:
+      - Table[[#This Row],[Col]]
+      - Table[Col]                          (whole data column)
+      - Table[[Col1]:[Col2]]                (multi-column data area)
+      - Table[[#Totals],[Col]]              (totals row cell)
+      - Table[[#Totals],[Col1]:[Col2]]      (totals row range)
+      - Table[[#Headers],[Col]]             (header cell)
+      - Table[#All|#Data|#Headers|#Totals]  (whole-table keywords)
+
+    Returns the formula unchanged if no rewrite is possible (so the formula
+    evaluator will surface None for the affected cells)."""
     if not named_tables or "[" not in formula:
         return formula
 
     def _sub(m: re.Match) -> str:
-        tname, col_name = m.group(1), m.group(2)
+        tname = m.group(1)
         tbl = named_tables.get(tname)
-        if tbl is None or col_name not in tbl.columns:
-            return m.group(0)  # leave unchanged -> formula will fail with None
-        col = tbl.columns[col_name]
-        addr = f"{get_column_letter(col)}{cell_row}"
-        sheet = tbl.sheet_name
-        prefix = f"'{sheet}'!" if " " in sheet or "'" in sheet else f"{sheet}!"
-        return f"{prefix}{addr}"
+        if tbl is None:
+            return m.group(0)
+        prefix = _sheet_prefix(tbl.sheet_name)
+        full_match = m.group(0)
+
+        # #This Row, col range
+        if m.group(2) and m.group(3):
+            c1, c2 = m.group(2), m.group(3)
+            if c1 not in tbl.columns or c2 not in tbl.columns:
+                return full_match
+            return (
+                f"{prefix}{get_column_letter(tbl.columns[c1])}{cell_row}"
+                f":{get_column_letter(tbl.columns[c2])}{cell_row}"
+            )
+
+        # #This Row, single col
+        if m.group(4):
+            col_name = m.group(4)
+            if col_name not in tbl.columns:
+                return full_match
+            return f"{prefix}{get_column_letter(tbl.columns[col_name])}{cell_row}"
+
+        # #Totals, col range
+        if m.group(5) and m.group(6):
+            if not tbl.has_totals_row:
+                return full_match
+            c1, c2 = m.group(5), m.group(6)
+            if c1 not in tbl.columns or c2 not in tbl.columns:
+                return full_match
+            totals_row = tbl.last_data_row + 1
+            return (
+                f"{prefix}{get_column_letter(tbl.columns[c1])}{totals_row}"
+                f":{get_column_letter(tbl.columns[c2])}{totals_row}"
+            )
+
+        # #Totals, single col
+        if m.group(7):
+            if not tbl.has_totals_row:
+                return full_match
+            col_name = m.group(7)
+            if col_name not in tbl.columns:
+                return full_match
+            totals_row = tbl.last_data_row + 1
+            return f"{prefix}{get_column_letter(tbl.columns[col_name])}{totals_row}"
+
+        # #Headers, single col
+        if m.group(8):
+            col_name = m.group(8)
+            if col_name not in tbl.columns:
+                return full_match
+            return f"{prefix}{get_column_letter(tbl.columns[col_name])}{tbl.header_row}"
+
+        # Column range [[A]:[B]]
+        if m.group(9) and m.group(10):
+            c1, c2 = m.group(9), m.group(10)
+            if c1 not in tbl.columns or c2 not in tbl.columns:
+                return full_match
+            return (
+                f"{prefix}{get_column_letter(tbl.columns[c1])}{tbl.first_data_row}"
+                f":{get_column_letter(tbl.columns[c2])}{tbl.last_data_row}"
+            )
+
+        # [#All] / [#Data] / [#Headers] / [#Totals] - whole-table keywords
+        rest = full_match[len(tname):]
+        if rest == "[#All]":
+            last_row = tbl.last_data_row + (1 if tbl.has_totals_row else 0)
+            return (
+                f"{prefix}{get_column_letter(tbl.first_col)}{tbl.header_row}"
+                f":{get_column_letter(tbl.last_col)}{last_row}"
+            )
+        if rest == "[#Data]":
+            return (
+                f"{prefix}{get_column_letter(tbl.first_col)}{tbl.first_data_row}"
+                f":{get_column_letter(tbl.last_col)}{tbl.last_data_row}"
+            )
+        if rest == "[#Headers]":
+            return (
+                f"{prefix}{get_column_letter(tbl.first_col)}{tbl.header_row}"
+                f":{get_column_letter(tbl.last_col)}{tbl.header_row}"
+            )
+        if rest == "[#Totals]":
+            if not tbl.has_totals_row:
+                return full_match
+            totals_row = tbl.last_data_row + 1
+            return (
+                f"{prefix}{get_column_letter(tbl.first_col)}{totals_row}"
+                f":{get_column_letter(tbl.last_col)}{totals_row}"
+            )
+
+        # Bare [ColName] - whole data column range
+        if m.group(11):
+            col_name = m.group(11)
+            if col_name not in tbl.columns:
+                return full_match
+            col = tbl.columns[col_name]
+            if tbl.last_data_row < tbl.first_data_row:
+                # Empty table - emit single cell to avoid an inverted range
+                return f"{prefix}{get_column_letter(col)}{tbl.first_data_row}"
+            return (
+                f"{prefix}{get_column_letter(col)}{tbl.first_data_row}"
+                f":{get_column_letter(col)}{tbl.last_data_row}"
+            )
+
+        return full_match
 
     return _STRUCTURED_REF_RE.sub(_sub, formula)
 
@@ -524,6 +729,8 @@ def _eval_one_cell(
         formula_text = cell.formula
         if named_tables and "[" in formula_text:
             formula_text = _resolve_structured_refs(formula_text, cell.row, named_tables)
+        if "SUBTOTAL(" in formula_text.upper():
+            formula_text = _rewrite_subtotal(formula_text)
         if "OFFSET" in formula_text.upper():
             formula_text = _resolve_offset_in_formula(
                 formula_text, sheet_name.upper(), value_map, parser
