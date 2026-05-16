@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import numpy as np
@@ -126,10 +127,135 @@ def _build_dep_graph(
             dep_ids: set[str] = set()
             for (sname, col, row) in refs:
                 sid = pos_to_id.get((sname, col, row))
-                if sid and sid != cell.stable_id:
+                if sid:
                     dep_ids.add(sid)
             deps[cell.stable_id] = dep_ids
     return deps
+
+
+def _tarjan_sccs(deps: dict[str, set[str]]) -> list[list[str]]:
+    """Return list of SCCs using Tarjan's algorithm.
+
+    Iteration order of ``all_nodes`` (a set) is non-deterministic in general,
+    but because Tarjan's DFS recurses into dependencies before finishing a node,
+    dependency SCCs are emitted (appended) before the SCCs that depend on them.
+    The result is therefore in sources-first topological order for this
+    implementation — suitable for direct use in evaluate_patch without reversal.
+
+    SCCs with len > 1, or len==1 with a self-loop, are circular.
+    """
+    all_nodes: set[str] = set(deps.keys())
+    for s in deps.values():
+        all_nodes |= s
+
+    index_counter = [0]
+    stack: list[str] = []
+    lowlink: dict[str, int] = {}
+    index: dict[str, int] = {}
+    on_stack: dict[str, bool] = {}
+    sccs: list[list[str]] = []
+
+    def strongconnect(v: str) -> None:
+        index[v] = lowlink[v] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(v)
+        on_stack[v] = True
+        for w in deps.get(v, set()):
+            if w not in index:
+                strongconnect(w)
+                lowlink[v] = min(lowlink[v], lowlink[w])
+            elif on_stack.get(w, False):
+                lowlink[v] = min(lowlink[v], index[w])
+        if lowlink[v] == index[v]:
+            scc: list[str] = []
+            while True:
+                w = stack.pop()
+                on_stack[w] = False
+                scc.append(w)
+                if w == v:
+                    break
+            sccs.append(scc)
+
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old_limit, len(all_nodes) * 3 + 1000))
+    try:
+        for v in all_nodes:
+            if v not in index:
+                strongconnect(v)
+    finally:
+        sys.setrecursionlimit(old_limit)
+    return sccs
+
+
+def _eval_one_cell(
+    sheet_name: str,
+    cell: Any,
+    value_map: dict[str, Any],
+    id_to_key: dict[str, str],
+    parser: Any,
+) -> Any:
+    """Evaluate a single formula cell. Returns scalar or None on error."""
+    try:
+        func = parser.ast(cell.formula)[1].compile()
+        kwargs: dict[str, Any] = {}
+        sheet_prefix = sheet_name.upper() + "!"
+        for input_key in func.inputs:
+            normalized = _normalize_input_key(input_key)
+            if ":" in normalized:
+                kwargs[input_key] = _expand_range(normalized, sheet_name.upper(), value_map)
+            else:
+                lookup_key = normalized if "!" in normalized else sheet_prefix + normalized
+                v = value_map.get(lookup_key)
+                kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+        return _scalar(func(**kwargs))
+    except Exception:
+        return None
+
+
+def _gauss_seidel(
+    scc_cells: list[tuple[str, Any]],
+    value_map: dict[str, Any],
+    id_to_key: dict[str, str],
+    parser: Any,
+    max_iterations: int = 50,
+    tolerance: float = 1e-6,
+) -> None:
+    """Iterate circular SCC in-place (Gauss-Seidel) until convergence.
+    Modifies value_map in place. Silent on non-convergence."""
+    # Seed None values with 0 (matches Excel behaviour)
+    for _, cell in scc_cells:
+        k = id_to_key[cell.stable_id]
+        if value_map.get(k) is None:
+            value_map[k] = 0.0
+
+    prev_signs: dict[str, int] = {}
+    omega = 1.0  # relaxation factor; reduced to 0.5 on detected oscillation
+
+    for _iteration in range(max_iterations):
+        max_change = 0.0
+        for sheet_name, cell in scc_cells:
+            k = id_to_key[cell.stable_id]
+            old_val = value_map.get(k)
+            new_val = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser)
+            if new_val is None:
+                continue
+            # Apply under-relaxation if oscillation was detected
+            if omega < 1.0 and isinstance(old_val, (int, float)):
+                new_val = (1.0 - omega) * float(old_val) + omega * float(new_val)
+            value_map[k] = new_val  # in-place update (Gauss-Seidel)
+            if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
+                change = abs(float(new_val) - float(old_val))
+                max_change = max(max_change, change)
+                # Oscillation: sign of delta flips -> engage damping
+                sign = 1 if new_val > old_val else (-1 if new_val < old_val else 0)
+                prev = prev_signs.get(cell.stable_id, 0)
+                if prev != 0 and sign != 0 and sign != prev:
+                    omega = 0.5
+                if sign != 0:
+                    prev_signs[cell.stable_id] = sign
+
+        if max_change < tolerance:
+            break  # converged
 
 
 def evaluate_patch(
@@ -138,18 +264,16 @@ def evaluate_patch(
 ) -> dict[str, Any]:
     """
     Apply {stable_id: new_value} patches and re-evaluate all formula cells.
-
     Returns {stable_id: computed_value} for every cell in the workbook.
-    workbook is not mutated — call evaluate_patch again to re-evaluate from scratch.
-    Formula evaluation is in topological order derived from formula references.
+    Uses SCC-based topological evaluation with Gauss-Seidel iteration for
+    circular references.
     """
     parser = formulas.Parser()
 
-    # Build value map: normalized_key -> current value
+    # Build value map and bidirectional key mappings
     value_map: dict[str, Any] = {}
     id_to_key: dict[str, str] = {}
     key_to_id: dict[str, str] = {}
-
     for sheet in workbook.sheets:
         for cell in sheet.cells:
             k = _fkey(sheet.name, cell.row, cell.col)
@@ -157,79 +281,43 @@ def evaluate_patch(
             id_to_key[cell.stable_id] = k
             key_to_id[k] = cell.stable_id
 
-    # Apply patches (override current values)
+    # Apply patches
     for stable_id, new_value in patches.items():
         k = id_to_key.get(stable_id)
         if k:
             value_map[k] = new_value
 
-    # Build accurate dependency graph from formula text
+    # Build dependency graph and cell lookup
     dep_graph = _build_dep_graph(workbook)
+    cell_lookup: dict[str, tuple[str, Any]] = {}  # stable_id -> (sheet_name, cell)
+    for sheet in workbook.sheets:
+        for cell in sheet.cells:
+            if cell.formula:
+                cell_lookup[cell.stable_id] = (sheet.name, cell)
 
-    # Topological sort: evaluate cells whose dependencies are already resolved
-    non_formula_ids = {
-        c.stable_id
-        for s in workbook.sheets
-        for c in s.cells
-        if not c.formula
-    }
-    resolved: set[str] = set(non_formula_ids)
+    # _tarjan_sccs emits SCCs in sources-first topological order (see its
+    # docstring). Dependency SCCs are appended before the SCCs that depend on
+    # them, so no reversal is needed here.
+    sccs = _tarjan_sccs(dep_graph)
+    sccs_topo = sccs
 
-    formula_cells = [
-        (s.name, c)
-        for s in workbook.sheets
-        for c in s.cells
-        if c.formula
-    ]
-    ordered: list[tuple[str, Any]] = []
-    remaining = list(formula_cells)
+    # Evaluate each SCC in topological order
+    for scc in sccs_topo:
+        formula_nodes = [sid for sid in scc if sid in cell_lookup]
+        if not formula_nodes:
+            continue  # SCC contains only non-formula (assumption) cells
 
-    for _ in range(len(formula_cells) + 1):
-        if not remaining:
-            break
-        next_round = []
-        for sheet_name, cell in remaining:
-            cell_deps = dep_graph.get(cell.stable_id, set())
-            if all(d in resolved for d in cell_deps):
-                ordered.append((sheet_name, cell))
-                resolved.add(cell.stable_id)
-            else:
-                next_round.append((sheet_name, cell))
-        if len(next_round) == len(remaining):
-            # Genuine cycle — mark all cyclic cells as None, skip evaluation
-            for sheet_name, cell in next_round:
-                value_map[id_to_key[cell.stable_id]] = None
-                resolved.add(cell.stable_id)
-            break
-        remaining = next_round
+        is_circular = len(scc) > 1 or scc[0] in dep_graph.get(scc[0], set())
 
-    # Evaluate each formula cell in dependency order
-    for sheet_name, cell in ordered:
-        try:
-            func = parser.ast(cell.formula)[1].compile()
-            kwargs: dict[str, Any] = {}
-            sheet_prefix = sheet_name.upper() + "!"
-            for input_key in func.inputs:
-                normalized = _normalize_input_key(input_key)
-                if ":" in normalized:
-                    kwargs[input_key] = _expand_range(
-                        normalized, sheet_name.upper(), value_map
-                    )
-                else:
-                    # Qualify unqualified cell refs with the current sheet
-                    lookup_key = (
-                        normalized
-                        if "!" in normalized
-                        else sheet_prefix + normalized
-                    )
-                    v = value_map.get(lookup_key)
-                    kwargs[input_key] = (
-                        _to_float(v) if isinstance(v, (int, float, type(None))) else v
-                    )
-            result = _scalar(func(**kwargs))
-            value_map[id_to_key[cell.stable_id]] = result
-        except Exception:
-            value_map[id_to_key[cell.stable_id]] = None
+        if is_circular:
+            scc_cells = [cell_lookup[sid] for sid in formula_nodes]
+            _gauss_seidel(scc_cells, value_map, id_to_key, parser)
+        else:
+            # Non-circular singleton: evaluate once
+            sid = formula_nodes[0]
+            sheet_name, cell = cell_lookup[sid]
+            result = _eval_one_cell(sheet_name, cell, value_map, id_to_key, parser)
+            value_map[id_to_key[sid]] = result
 
     return {
         key_to_id[k]: _scalar(v)
