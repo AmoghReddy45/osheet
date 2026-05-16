@@ -234,10 +234,34 @@ def test3_osheet(wb: osheet.OsheetWorkbook) -> dict:
     if not growth_cell:
         return {"computed_value": None, "error": "growth_rate_monthly not found as assumption"}
     proposal = osheet.propose_patch(wb, growth_cell.stable_id, 0.05)
-    revenue_key = next(
-        (k for k in proposal.computed_values if "total_revenue" in k.lower() or "annual" in k.lower()),
-        None,
-    )
+
+    # Find the Annual Total_Revenue cell by scanning label cells in the Annual sheet.
+    # computed_values keys are positional (e.g., "annual.b3"), so we locate the row
+    # whose label contains "total_revenue" and build the corresponding key.
+    revenue_key = None
+    cell_map = {(c.sheet_name, c.row, c.col): c for c in wb.all_cells}
+    for c in wb.all_cells:
+        if c.sheet_name.lower() == "annual" and isinstance(c.value, str) and "total_revenue" in c.value.lower():
+            # The formula cell is one column to the right (col B when label is col A)
+            formula_cell = cell_map.get((c.sheet_name, c.row, c.col + 1))
+            if formula_cell:
+                candidate = formula_cell.stable_id.lower()
+                if candidate in {k.lower() for k in proposal.computed_values}:
+                    revenue_key = next(k for k in proposal.computed_values if k.lower() == candidate)
+                    break
+
+    # Fallback: prioritize "total_revenue" in key name, then first sorted annual key
+    if revenue_key is None:
+        revenue_key = next(
+            (k for k in proposal.computed_values if "total_revenue" in k.lower()),
+            None,
+        )
+    if revenue_key is None:
+        revenue_key = next(
+            (k for k in sorted(proposal.computed_values) if "annual" in k.lower()),
+            None,
+        )
+
     computed = proposal.computed_values.get(revenue_key) if revenue_key else None
     latency = (time.time() - t0) * 1000
     return {"computed_value": computed, "cell_id": revenue_key, "latency_ms": latency, "affected_count": len(proposal.affected_cells)}
@@ -338,7 +362,7 @@ def main() -> None:
     print("  [osheet]   running propose_patch()...")
     o3 = test3_osheet(wb)
     if o3.get("computed_value") is not None:
-        print(f"  [osheet]   computed Annual Revenue: {o3['computed_value']:,.2f}  "
+        print(f"  [osheet]   computed Annual Total_Revenue [{o3['cell_id']}]: {o3['computed_value']:,.2f}  "
               f"({o3['affected_count']} cells changed, {o3['latency_ms']:.0f}ms)")
         if b3["guessed_value"] > 0 and o3["computed_value"]:
             error_pct = abs(b3["guessed_value"] - o3["computed_value"]) / o3["computed_value"] * 100
