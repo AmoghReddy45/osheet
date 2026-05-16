@@ -6,18 +6,37 @@ import osheet
 from metrics import QUESTIONS, BenchmarkResult, QuestionResult, score_answer
 
 
+def _label_for(c, cell_map: dict) -> str:
+    """Find the nearest text label in the same row (look left up to 4 cols)."""
+    for offset in range(1, 5):
+        neighbor = cell_map.get((c.sheet_name, c.row, c.col - offset))
+        if neighbor and isinstance(neighbor.value, str) and neighbor.value.strip():
+            return neighbor.value.strip()
+    return ""
+
+
 def workbook_to_context(wb) -> str:
+    all_cells = [c for s in wb.sheets for c in s.cells]
+    cell_map = {(c.sheet_name, c.row, c.col): c for c in all_cells}
+
     lines = []
     lines.append(f"Workbook: {wb.manifest.sheet_count} sheets, {wb.manifest.table_count} tables")
+
     lines.append(f"\nAssumptions ({len(wb.assumptions)}):")
     for c in wb.assumptions:
-        lines.append(f"  [{c.stable_id}] = {c.value}")
+        label = _label_for(c, cell_map)
+        label_str = f" ({label})" if label else ""
+        lines.append(f"  [{c.stable_id}]{label_str} = {c.value}")
+
     lines.append(f"\nOutputs ({len(wb.outputs)}):")
     for c in wb.outputs:
+        label = _label_for(c, cell_map)
+        label_str = f" ({label})" if label else ""
         val = c.value if c.value is not None else f"formula: {c.formula}"
-        lines.append(f"  [{c.stable_id}] = {val}")
+        lines.append(f"  [{c.stable_id}]{label_str} = {val}")
+
     lines.append("\nFormula dependencies (sample):")
-    for c in wb.all_cells:
+    for c in all_cells:
         if c.depends_on:
             lines.append(f"  {c.stable_id} depends on: {', '.join(c.depends_on[:3])}")
     return "\n".join(lines)
