@@ -15,8 +15,26 @@ def _fkey(sheet_name: str, row: int, col: int) -> str:
     return f"{sheet_name.upper()}!{get_column_letter(col)}{row}"
 
 
+def _normalize_input_key(input_key: str) -> str:
+    """Normalize formulas-library input key to match our value_map keys.
+
+    formulas lib outputs: 'FIXED ASSETS'!D15 (with quotes for sheet names with spaces)
+    Our _fkey() outputs:  FIXED ASSETS!D15   (no quotes)
+    """
+    if input_key.startswith("'"):
+        # Find the closing single quote
+        bang = input_key.find("'", 1)
+        if bang != -1 and input_key[bang + 1 : bang + 2] == "!":
+            sheet = input_key[1:bang]
+            rest = input_key[bang + 2 :]
+            return f"{sheet}!{rest}"
+    return input_key
+
+
 def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any]) -> np.ndarray:
     """Turn 'B2:B13' or 'SHEET!B2:SHEET!B13' into a numpy row array for SUM etc."""
+    # Strip quotes from sheet name portion if present (e.g. 'FIXED ASSETS'!B2:B13)
+    range_key = _normalize_input_key(range_key)
     if "!" in range_key:
         left, right = range_key.split(":", 1)
         sheet = left.split("!")[0]
@@ -192,16 +210,17 @@ def evaluate_patch(
             kwargs: dict[str, Any] = {}
             sheet_prefix = sheet_name.upper() + "!"
             for input_key in func.inputs:
-                if ":" in input_key:
+                normalized = _normalize_input_key(input_key)
+                if ":" in normalized:
                     kwargs[input_key] = _expand_range(
-                        input_key, sheet_name.upper(), value_map
+                        normalized, sheet_name.upper(), value_map
                     )
                 else:
                     # Qualify unqualified cell refs with the current sheet
                     lookup_key = (
-                        input_key
-                        if "!" in input_key
-                        else sheet_prefix + input_key
+                        normalized
+                        if "!" in normalized
+                        else sheet_prefix + normalized
                     )
                     v = value_map.get(lookup_key)
                     kwargs[input_key] = (
