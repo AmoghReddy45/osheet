@@ -224,3 +224,90 @@ def test_downstream_of_circular_uses_converged_value(circular_with_downstream_by
     assert b1_val is not None
     assert d1_val is not None
     assert abs(d1_val - (b1_val + 500)) < 0.1
+
+
+# --- OFFSET-as-range-endpoint tests -----------------------------------------
+
+
+def _single_sheet_bytes(cells: dict, title: str = "Sheet1") -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = title
+    for addr, val in cells.items():
+        ws[addr] = val
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_offset_simple_negative_col():
+    """E1 = SUM(A1:OFFSET(A1,0,2)) → A1:C1 = 1+2+3 = 6."""
+    data = {
+        "A1": 1, "B1": 2, "C1": 3, "D1": 4,
+        "E1": "=SUM(A1:OFFSET(A1,0,2))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    e1 = next(c for c in workbook.all_cells if c.formula and "OFFSET" in c.formula)
+    assert result[e1.stable_id] == 6
+
+
+def test_offset_inside_average_with_min():
+    """=AVERAGE(L322:OFFSET(L322,0,MIN(2,L5-1))) → L322:N322 → avg of 1,2,3 = 2.0"""
+    data = {
+        "L322": 1, "M322": 2, "N322": 3, "O322": 4, "P322": 5,
+        "L5": 3,
+        "A1": "=AVERAGE(L322:OFFSET(L322,0,MIN(2,L5-1)))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula and "AVERAGE" in c.formula)
+    assert abs(result[a1.stable_id] - 2.0) < 1e-9
+
+
+def test_offset_with_bare_cell_ref():
+    """=AVERAGE(L322:OFFSET(L322,0,L5)) where L5=2 → L322:N322 → avg of 10,20,30 = 20.0"""
+    data = {
+        "L322": 10, "M322": 20, "N322": 30,
+        "L5": 2,
+        "A1": "=AVERAGE(L322:OFFSET(L322,0,L5))",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    a1 = next(c for c in workbook.all_cells if c.formula and "AVERAGE" in c.formula)
+    assert abs(result[a1.stable_id] - 20.0) < 1e-9
+
+
+def test_offset_out_of_range_returns_none():
+    """=OFFSET(A1,0,-5) → new col would be -4 → caller returns None."""
+    data = {
+        "A1": 1,
+        "B1": "=OFFSET(A1,0,-5)",
+    }
+    workbook = parse_xlsx(_single_sheet_bytes(data))
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] is None
+
+
+def test_offset_with_sheet_name():
+    """Cross-sheet OFFSET reference resolves correctly."""
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Data"
+    ws1["A1"] = 10
+    ws1["B1"] = 20
+    ws1["C1"] = 30
+    ws2 = wb.create_sheet("Calc")
+    ws2["A1"] = "=SUM(Data!A1:OFFSET(Data!A1,0,2))"
+    buf = io.BytesIO()
+    wb.save(buf)
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    calc = next(c for c in workbook.all_cells if c.formula and "SUM" in c.formula)
+    assert result[calc.stable_id] == 60

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
@@ -9,6 +10,12 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 from osheet.models import Workbook
 from osheet.analyzer.graph import _parse_refs
+
+
+# Single-cell ref (optionally sheet-qualified). Sheet may be quoted or bare.
+_SINGLE_CELL_RE = re.compile(
+    r"^\s*(?:(?:'([^']+)'|([A-Za-z_][\w ]*))!)?\s*\$?([A-Z]+)\$?(\d+)\s*$"
+)
 
 
 def _fkey(sheet_name: str, row: int, col: int) -> str:
@@ -105,6 +112,194 @@ def _scalar(val: Any) -> Any:
     return val
 
 
+def _split_top_level_commas(body: str) -> list[str]:
+    """Split a function body at top-level commas, respecting parens and quotes."""
+    parts: list[str] = []
+    depth = 0
+    in_quote = False
+    start = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(body[start:i])
+                start = i + 1
+        i += 1
+    parts.append(body[start:])
+    return parts
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    """Given index of '(' in text, return index of matching ')'. -1 if not found.
+    Ignores parens inside double-quoted string literals."""
+    depth = 0
+    in_quote = False
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def _find_innermost_offset(formula: str) -> tuple[int, int] | None:
+    """Find an OFFSET(...) call whose body contains no nested OFFSET(.
+    Returns (start_of_OFFSET, index_of_closing_paren) or None."""
+    upper = formula.upper()
+    search_from = 0
+    while True:
+        idx = upper.find("OFFSET(", search_from)
+        if idx == -1:
+            return None
+        # Must be at start of token (prev char non-alnum/underscore) to avoid matching e.g. MYOFFSET(
+        if idx > 0 and (formula[idx - 1].isalnum() or formula[idx - 1] == "_"):
+            search_from = idx + 1
+            continue
+        open_paren = idx + len("OFFSET")  # points at '('
+        close_paren = _find_matching_paren(formula, open_paren)
+        if close_paren == -1:
+            return None
+        body = formula[open_paren + 1 : close_paren]
+        if "OFFSET(" not in body.upper():
+            return (idx, close_paren)
+        # Has nested OFFSET; recurse into body
+        inner = _find_innermost_offset(body)
+        if inner is None:
+            # Shouldn't happen, but be safe
+            return (idx, close_paren)
+        b_start, b_end = inner
+        return (open_paren + 1 + b_start, open_paren + 1 + b_end)
+
+
+def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], parser: Any) -> int:
+    func = parser.ast(f"={expr}")[1].compile()
+    kwargs: dict[str, Any] = {}
+    sheet_prefix = default_sheet.upper() + "!"
+    for input_key in func.inputs:
+        normalized = _normalize_input_key(input_key)
+        if ":" in normalized:
+            kwargs[input_key] = _expand_range(normalized, default_sheet.upper(), value_map)
+        else:
+            lookup = normalized if "!" in normalized else sheet_prefix + normalized
+            v = value_map.get(lookup)
+            kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+    result = _scalar(func(**kwargs))
+    return int(result)
+
+
+def _parse_single_cell_ref(ref: str) -> tuple[str | None, str, int]:
+    """Parse 'A1' / '$A$1' / 'Sheet!A1' / ''Sheet Name'!A1' into (sheet_or_None, col_letters, row).
+    Raises ValueError if not a single-cell reference."""
+    m = _SINGLE_CELL_RE.match(ref)
+    if not m:
+        raise ValueError(f"not a single cell ref: {ref!r}")
+    quoted_sheet, bare_sheet, col_letters, row_str = m.groups()
+    sheet = quoted_sheet or bare_sheet
+    return sheet, col_letters.upper(), int(row_str)
+
+
+# Matches `<sheet>!<cell>:<sheet>!<cell>` where sheets are identical.
+# Captures both quoted ('Sheet Name') and bare (Sheet1) forms.
+_REDUNDANT_SHEET_RE = re.compile(
+    r"(?:'([^']+)'|([A-Za-z_][\w ]*))!(\$?[A-Z]+\$?\d+)"
+    r":"
+    r"(?:'([^']+)'|([A-Za-z_][\w ]*))!(\$?[A-Z]+\$?\d+)"
+)
+
+
+def _collapse_redundant_sheet_in_range(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        left_sheet = m.group(1) or m.group(2)
+        right_sheet = m.group(4) or m.group(5)
+        if left_sheet.upper() == right_sheet.upper():
+            left_prefix = m.group(0).split(":", 1)[0]
+            return f"{left_prefix}:{m.group(6)}"
+        return m.group(0)
+    return _REDUNDANT_SHEET_RE.sub(repl, text)
+
+
+def _resolve_offset_in_formula(
+    formula: str,
+    default_sheet: str,
+    value_map: dict[str, Any],
+    parser: Any,
+) -> str:
+    """Rewrite OFFSET(ref, rows, cols, [height], [width]) → concrete cell or range
+    in the formula text. On any failure, returns the original formula unchanged."""
+    try:
+        current = formula
+        # Bound iterations to avoid pathological loops
+        for _ in range(64):
+            upper = current.upper()
+            if "OFFSET(" not in upper:
+                break
+            located = _find_innermost_offset(current)
+            if located is None:
+                break
+            offset_start, close_paren = located
+            open_paren = offset_start + len("OFFSET")
+            body = current[open_paren + 1 : close_paren]
+            args = _split_top_level_commas(body)
+            if len(args) < 3:
+                return formula  # malformed; bail
+            ref_arg = args[0].strip()
+            rows_int = _eval_subexpr(args[1].strip(), default_sheet, value_map, parser)
+            cols_int = _eval_subexpr(args[2].strip(), default_sheet, value_map, parser)
+            height = (
+                _eval_subexpr(args[3].strip(), default_sheet, value_map, parser)
+                if len(args) >= 4 and args[3].strip()
+                else 1
+            )
+            width = (
+                _eval_subexpr(args[4].strip(), default_sheet, value_map, parser)
+                if len(args) >= 5 and args[4].strip()
+                else 1
+            )
+
+            sheet_name, col_letters, base_row = _parse_single_cell_ref(ref_arg)
+            base_col = column_index_from_string(col_letters)
+            new_col = base_col + cols_int
+            new_row = base_row + rows_int
+            if new_col < 1 or new_row < 1:
+                raise ValueError("OFFSET out of range")
+            top_addr = f"{get_column_letter(new_col)}{new_row}"
+            if height > 1 or width > 1:
+                bottom_col = new_col + max(width, 1) - 1
+                bottom_row = new_row + max(height, 1) - 1
+                bottom_addr = f"{get_column_letter(bottom_col)}{bottom_row}"
+                new_addr = f"{top_addr}:{bottom_addr}"
+            else:
+                new_addr = top_addr
+            if sheet_name:
+                prefix = (
+                    f"'{sheet_name}'!" if " " in sheet_name else f"{sheet_name}!"
+                )
+                new_addr = prefix + new_addr
+
+            current = current[:offset_start] + new_addr + current[close_paren + 1 :]
+
+        # Normalize `Sheet!X:Sheet!Y` → `Sheet!X:Y` (formulas lib treats the
+        # duplicated-sheet form as two scalars, not a range).
+        return _collapse_redundant_sheet_in_range(current)
+    except Exception:
+        return formula
+
+
 def _build_dep_graph(
     workbook: Workbook,
 ) -> dict[str, set[str]]:
@@ -196,7 +391,12 @@ def _eval_one_cell(
 ) -> Any:
     """Evaluate a single formula cell. Returns scalar or None on error."""
     try:
-        func = parser.ast(cell.formula)[1].compile()
+        formula_text = cell.formula
+        if "OFFSET" in formula_text.upper():
+            formula_text = _resolve_offset_in_formula(
+                formula_text, sheet_name.upper(), value_map, parser
+            )
+        func = parser.ast(formula_text)[1].compile()
         kwargs: dict[str, Any] = {}
         sheet_prefix = sheet_name.upper() + "!"
         for input_key in func.inputs:
