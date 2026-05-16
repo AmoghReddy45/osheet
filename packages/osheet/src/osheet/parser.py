@@ -1,5 +1,6 @@
 from __future__ import annotations
 import io
+from datetime import datetime as _dt
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell as OxlCell
 from openpyxl.utils import column_index_from_string
@@ -90,4 +91,10 @@ def parse_xlsx(data: bytes) -> Workbook:
             )
 
     manifest = Manifest(source_file="", sheet_count=len(sheets))
+    # openpyxl exposes the workbook epoch as a datetime: 1899-12-30 for 1900
+    # mode (default) or 1904-01-01 for 1904 mode (Mac Excel).
+    try:
+        manifest.epoch_year_1904 = (wb_ox.epoch == _dt(1904, 1, 1))
+    except Exception:
+        manifest.epoch_year_1904 = False
     return Workbook(sheets=sheets, manifest=manifest, named_tables=named_tables)

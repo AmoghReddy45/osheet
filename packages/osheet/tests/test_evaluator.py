@@ -1,4 +1,5 @@
 # packages/osheet/tests/test_evaluator.py
+import datetime as dt
 import io
 import openpyxl
 import pytest
@@ -638,3 +639,104 @@ def test_structured_ref_bare_brackets_with_unknown_table_unchanged():
     result = evaluate_patch({}, workbook)
     b1 = next(c for c in workbook.all_cells if c.formula)
     assert result[b1.stable_id] is None
+
+
+# --- Date pipeline tests (TODAY/DATE/YEAR/EDATE/EOMONTH/TEXT/arithmetic) -----
+
+
+@pytest.fixture
+def date_bytes() -> bytes:
+    """Workbook with date inputs and a variety of date-formula outputs."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Config"
+    ws['B3'] = dt.datetime(2020, 1, 1)
+    ws['B4'] = dt.datetime(2019, 6, 1)
+    ws['C3'] = "=YEAR(B3)"
+    ws['C4'] = "=EDATE(B3, 12)"
+    ws['C5'] = "=EOMONTH(B3, 0)"
+    ws['C6'] = "=TEXT(B3, \"mmmm\")"
+    ws['C7'] = "=B3 + 30"
+    ws['C8'] = "=B3 > B4"
+    ws['C9'] = "=DATE(2026, 5, 16)"
+    ws['C10'] = "=TODAY()"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _cell_by_formula(workbook, needle: str):
+    return next(c for c in workbook.all_cells if c.formula and needle in c.formula)
+
+
+def test_year_of_date_cell(date_bytes):
+    """=YEAR(B3) where B3 is 2020-01-01 -> 2020."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "YEAR(B3)")
+    assert int(result[cell.stable_id]) == 2020
+
+
+def test_edate_one_year_forward(date_bytes):
+    """=EDATE(B3, 12) where B3 = 2020-01-01 -> 2021-01-01 serial 44197."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "EDATE")
+    assert abs(float(result[cell.stable_id]) - 44197) <= 0.5
+
+
+def test_eomonth_last_day(date_bytes):
+    """=EOMONTH(B3, 0) where B3 = 2020-01-01 -> 2020-01-31 serial 43861."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "EOMONTH")
+    assert abs(float(result[cell.stable_id]) - 43861) <= 0.5
+
+
+def test_date_function_returns_serial(date_bytes):
+    """=DATE(2026, 5, 16) -> serial 46158."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "DATE(2026")
+    assert abs(float(result[cell.stable_id]) - 46158) <= 0.5
+
+
+def test_today_returns_today_serial(date_bytes):
+    """=TODAY() -> serial of today's date (within ±1 day for timezone)."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "TODAY")
+    expected = (dt.date.today() - dt.date(1899, 12, 30)).days
+    assert abs(float(result[cell.stable_id]) - expected) <= 1
+
+
+def test_text_month_name(date_bytes):
+    """=TEXT(B3, "mmmm") where B3 = 2020-01-01 -> "January"."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "TEXT")
+    assert result[cell.stable_id] == "January"
+
+
+def test_date_arithmetic_add_days(date_bytes):
+    """=B3 + 30 where B3 = 2020-01-01 -> 2020-01-31 serial 43861."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "B3 + 30")
+    assert abs(float(result[cell.stable_id]) - 43861) <= 0.5
+
+
+def test_date_comparison(date_bytes):
+    """=B3 > B4 where B3 = 2020-01-01, B4 = 2019-06-01 -> True."""
+    workbook = parse_xlsx(date_bytes)
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    cell = _cell_by_formula(workbook, "B3 > B4")
+    assert bool(result[cell.stable_id]) is True

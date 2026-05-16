@@ -89,6 +89,7 @@ class Manifest(BaseModel):
     assumption_count: int = 0
     output_count: int = 0
     warnings: list[Warning] = Field(default_factory=list)
+    epoch_year_1904: bool = False  # True if workbook uses 1904 date mode (Mac Excel)
 
 
 class Workbook(BaseModel):

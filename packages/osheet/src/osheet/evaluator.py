@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import date, datetime, time
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,34 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 from osheet.models import Workbook
 from osheet.analyzer.graph import _parse_refs
+
+
+# Excel epoch (1900 date system). Excel's serial 1 is 1900-01-01, but because
+# Excel incorrectly treats 1900 as a leap year, we use 1899-12-30 as the epoch
+# so the resulting offsets match Excel for dates >= 1900-03-01 (i.e. all real
+# financial-model usage).
+_EXCEL_EPOCH = date(1899, 12, 30)
+# 1904 mode is rare and none of the benchmark models use it. We track it on
+# the Manifest but the conversion path below always uses _EXCEL_EPOCH. If a
+# 1904-mode workbook surfaces in the future, thread the workbook epoch through
+# to _to_float (TODO).
+
+
+def _datetime_to_serial(d: Any, epoch: date = _EXCEL_EPOCH) -> float:
+    """Convert datetime/date/time -> Excel serial number (days since epoch).
+    Times become fractional days. Pre-1900-03-01 dates are off by 1 vs Excel
+    (the 1900 leap-year bug); acceptable for financial models."""
+    if isinstance(d, datetime):
+        return (d.date() - epoch).days + (
+            d.hour * 3600 + d.minute * 60 + d.second + d.microsecond / 1e6
+        ) / 86400.0
+    if isinstance(d, date):
+        return (d - epoch).days
+    if isinstance(d, time):
+        return (
+            d.hour * 3600 + d.minute * 60 + d.second + d.microsecond / 1e6
+        ) / 86400.0
+    raise TypeError(f"not a date/datetime/time: {type(d).__name__}")
 
 
 # Single-cell ref (optionally sheet-qualified). Sheet may be quoted or bare.
@@ -80,6 +109,11 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
 def _to_float(val: Any) -> float:
     if val is None:
         return 0.0  # Excel treats empty/missing cells as 0 in arithmetic
+    if isinstance(val, (datetime, date, time)):
+        # Dates pass through formula evaluation as Excel serial numbers so that
+        # YEAR/EDATE/EOMONTH/TEXT/etc. (which the formulas lib implements
+        # against serials) work, instead of erroring with #VALUE!.
+        return _datetime_to_serial(val)
     if isinstance(val, (int, float)):
         return float(val)
     # Try numpy scalar extraction
@@ -209,7 +243,10 @@ def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], pars
         else:
             lookup = normalized if "!" in normalized else sheet_prefix + normalized
             v = value_map.get(lookup)
-            kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+            if isinstance(v, (int, float, type(None), datetime, date, time)):
+                kwargs[input_key] = _to_float(v)
+            else:
+                kwargs[input_key] = v
     result = _scalar(func(**kwargs))
     return int(result)
 
@@ -248,7 +285,10 @@ def _eval_subexpr_scalar(
             else:
                 lookup = normalized if "!" in normalized else sheet_prefix + normalized
                 v = value_map.get(lookup)
-                kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+                if isinstance(v, (int, float, type(None), datetime, date, time)):
+                    kwargs[input_key] = _to_float(v)
+                else:
+                    kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:
         return None
@@ -763,7 +803,10 @@ def _eval_one_cell(
             else:
                 lookup_key = normalized if "!" in normalized else sheet_prefix + normalized
                 v = value_map.get(lookup_key)
-                kwargs[input_key] = _to_float(v) if isinstance(v, (int, float, type(None))) else v
+                if isinstance(v, (int, float, type(None), datetime, date, time)):
+                    kwargs[input_key] = _to_float(v)
+                else:
+                    kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:
         return None
