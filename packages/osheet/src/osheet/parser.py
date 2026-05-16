@@ -7,6 +7,51 @@ from openpyxl.utils import column_index_from_string
 from osheet.models import Cell, CellRole, NamedTable, Sheet, Workbook, Manifest
 
 
+def _is_numeric_format(fmt: str | None) -> bool:
+    """True if Excel cell number_format implies the value is numeric."""
+    if not fmt or fmt == "General":
+        return False
+    # Common patterns: #,##0  #,##0.00  $#,##0  0%  0.00  #,##0_);(#,##0)  etc.
+    # Heuristic: presence of #, 0, or % in the format, and no '@' (which means text)
+    if "@" in fmt:
+        return False
+    return any(ch in fmt for ch in "#0%")
+
+
+def _maybe_coerce_value(value, number_format: str | None):
+    """If value is a string that parses as a number and the cell format is numeric,
+    return the float; otherwise return value unchanged."""
+    if not isinstance(value, str):
+        return value
+    if not _is_numeric_format(number_format):
+        return value
+    # Reuse the same coercion as evaluator
+    s = value.strip()
+    if not s:
+        return value
+    is_negative = False
+    if s.startswith("(") and s.endswith(")"):
+        is_negative = True
+        s = s[1:-1].strip()
+    for sym in ("$", "€", "£", "¥"):
+        if s.startswith(sym):
+            s = s[len(sym):].strip()
+            break
+    is_percent = s.endswith("%")
+    if is_percent:
+        s = s[:-1].strip()
+    s = s.replace(",", "")
+    try:
+        v = float(s)
+        if is_percent:
+            v /= 100.0
+        if is_negative:
+            v = -v
+        return v
+    except (ValueError, TypeError):
+        return value  # unparseable — keep as string
+
+
 def _fill_color(cell: OxlCell) -> str | None:
     try:
         fill = cell.fill
@@ -35,6 +80,10 @@ def parse_xlsx(data: bytes) -> Workbook:
                 if isinstance(raw_val, str) and raw_val.startswith("="):
                     formula = raw_val
                     value = None
+                else:
+                    # Coerce numeric-formatted text (e.g. "3,827", "(2,032)") to float
+                    # so direct cell references propagate numbers, not strings.
+                    value = _maybe_coerce_value(value, ox_cell.number_format)
 
                 cells.append(Cell(
                     stable_id=f"{ws.title}.{ox_cell.column_letter}{ox_cell.row}",
