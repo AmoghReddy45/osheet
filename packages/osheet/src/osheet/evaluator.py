@@ -129,11 +129,16 @@ def _coerce_string_to_float(s: str) -> float:
       - Percentages:                 "50%" -> 0.5
       - Leading/trailing whitespace: "  5,661  " -> 5661.0
       - Scientific notation:         "5.66e3" -> 5660.0 (via float())
-      - Empty string:                "" -> 0.0 (Excel arithmetic convention)
+
+    Note: empty string ("") returns nan (NOT 0.0). Excel distinguishes empty
+    cells (treated as 0 in arithmetic) from text values including "" (which
+    raise #VALUE! in arithmetic and can be caught by IFERROR). Conflating the
+    two breaks the common =IFERROR(<inner-that-may-return-"">*x, fallback)
+    pattern: silent 0-coercion makes IFERROR's error path unreachable.
     """
     s = s.strip()
     if not s:
-        return 0.0  # empty string -> 0 in arithmetic
+        return float("nan")  # empty string -> not coerceable; let arithmetic raise #VALUE!
     is_negative = False
     # Accounting format: (1,234) means -1234
     if s.startswith("(") and s.endswith(")"):

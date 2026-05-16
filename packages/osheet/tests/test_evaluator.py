@@ -839,8 +839,18 @@ def test_to_float_whitespace():
 
 
 def test_to_float_empty_string():
+    """Empty string should NOT coerce to 0 — Excel treats text-typed "" as
+    #VALUE! in arithmetic, distinct from a truly empty cell (None -> 0).
+    Conflating the two breaks IFERROR(""*x, fallback) handling."""
     from osheet.evaluator import _to_float
-    assert _to_float("") == 0.0
+    import math
+    assert math.isnan(_to_float(""))
+
+
+def test_to_float_none_is_zero():
+    """Empty CELL (None) should still coerce to 0 in arithmetic (unchanged)."""
+    from osheet.evaluator import _to_float
+    assert _to_float(None) == 0.0
 
 
 def test_to_float_unparseable_returns_nan():
@@ -947,3 +957,67 @@ def test_offset_with_static_constant_args_adds_dep():
 
     result = evaluate_patch({}, workbook)
     assert abs(result[d1.stable_id] - 10) < 0.01  # A1=1 * 10
+
+
+def test_iferror_catches_empty_string_arithmetic():
+    """=IFERROR(A1*0.15, " ") where A1=IFERROR(<err>, "") -> " ", not 0.0.
+
+    This is the exact business_financial_plan pattern: a chained IFERROR where
+    the inner branch returns "" and the outer branch multiplies it. Silent
+    ""->0 coercion previously masked the arithmetic error, making IFERROR's
+    fallback unreachable and returning 0.0 instead of " "."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Sheet1"
+    # A1 evaluates to "" via inner IFERROR; B1 then needs to surface that as
+    # a #VALUE! error so its outer IFERROR can return the fallback.
+    ws['A1'] = '=IFERROR(1/0, "")'
+    ws['B1'] = '=IFERROR(A1*0.15, " ")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.row == 1 and c.col == 2)
+    assert result[b1.stable_id] == " ", f"got {result[b1.stable_id]!r}"
+
+
+def test_iferror_catches_text_arithmetic():
+    """=IFERROR("hello"*2, "fallback") should return "fallback"."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Sheet1"
+    ws['A1'] = "hello"
+    ws['B1'] = '=IFERROR(A1*2, "fallback")'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == "fallback"
+
+
+def test_empty_cell_arithmetic_still_zero():
+    """=A1*5 where A1 is empty (None) should still return 0, not error.
+    Empty CELL != empty STRING — only the latter should propagate as text."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Sheet1"
+    ws['B1'] = "=A1*5"
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    b1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[b1.stable_id] == 0
