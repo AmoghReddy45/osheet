@@ -860,13 +860,13 @@ def test_to_float_unparseable_returns_nan():
     assert math.isnan(_to_float("N/A"))
 
 
-def test_average_over_comma_formatted_strings():
-    """Integration: AVERAGE works when cells contain '2,032' style strings."""
+def test_average_over_comma_formatted_strings_excel_skips_text():
+    """Excel skips text-typed cells in AVERAGE. After fix, both args skipped → #DIV/0! → nan."""
     import io, openpyxl
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Sheet1"
-    ws['A1'] = '5,661'
+    ws['A1'] = '5,661'   # stored as text by openpyxl
     ws['B1'] = '2,032'
     ws['C1'] = '=AVERAGE(A1, B1)'
     buf = io.BytesIO(); wb.save(buf)
@@ -878,7 +878,34 @@ def test_average_over_comma_formatted_strings():
     run_all(workbook)
     result = evaluate_patch({}, workbook)
     c1 = next(c for c in workbook.all_cells if c.formula and "AVERAGE" in c.formula)
-    assert abs(result[c1.stable_id] - (5661 + 2032) / 2) < 0.01
+    # Both A1 and B1 are text-typed strings; AVERAGE skips both → DIV/0
+    # Either nan or specific error indicator is acceptable
+    v = result[c1.stable_id]
+    import math
+    assert v is None or (isinstance(v, float) and math.isnan(v)), f"expected nan/None, got {v!r}"
+
+
+def test_average_skips_text_cell_includes_numeric_cell():
+    """Mirrors the nvidia_dcf failure: AVERAGE(text_cell, numeric_cell) should
+    skip the text and average just the numeric (matches Excel exactly)."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '3,827'   # text-typed
+    ws['A1'].number_format = '#,##0'
+    ws['B1'] = 4908       # numeric
+    ws['C1'] = '=AVERAGE(A1, B1)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula)
+    assert result[c1.stable_id] == 4908.0
 
 
 def test_sum_over_comma_formatted_range():

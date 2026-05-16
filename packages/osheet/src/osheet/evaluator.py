@@ -433,12 +433,15 @@ def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], pars
         else:
             lookup = normalized if "!" in normalized else sheet_prefix + normalized
             v = value_map.get(lookup)
-            if isinstance(v, (int, float, type(None), datetime, date, time)):
+            if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                 kwargs[input_key] = _to_float(v)
-            elif isinstance(v, str):
-                coerced = _coerce_string_to_float(v)
-                kwargs[input_key] = v if math.isnan(coerced) else coerced
             else:
+                # Strings, numpy types, etc. pass through unchanged.
+                # The formulas library handles strings appropriately:
+                #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
+                #   - arithmetic coerces clean numeric strings, returns #VALUE! for
+                #     comma-formatted/non-numeric (matches Excel)
+                # This matches Excel's stored-type semantics.
                 kwargs[input_key] = v
     result = _scalar(func(**kwargs))
     return int(result)
@@ -479,12 +482,15 @@ def _eval_subexpr_scalar(
             else:
                 lookup = normalized if "!" in normalized else sheet_prefix + normalized
                 v = value_map.get(lookup)
-                if isinstance(v, (int, float, type(None), datetime, date, time)):
+                if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
-                elif isinstance(v, str):
-                    coerced = _coerce_string_to_float(v)
-                    kwargs[input_key] = v if math.isnan(coerced) else coerced
                 else:
+                    # Strings, numpy types, etc. pass through unchanged.
+                    # The formulas library handles strings appropriately:
+                    #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
+                    #   - arithmetic coerces clean numeric strings, returns #VALUE! for
+                    #     comma-formatted/non-numeric (matches Excel)
+                    # This matches Excel's stored-type semantics.
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:
@@ -1104,15 +1110,15 @@ def _eval_one_cell(
             else:
                 lookup_key = normalized if "!" in normalized else sheet_prefix + normalized
                 v = value_map.get(lookup_key)
-                if isinstance(v, (int, float, type(None), datetime, date, time)):
+                if isinstance(v, (int, float, bool, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
-                elif isinstance(v, str):
-                    # Excel-style implicit numeric coercion of formatted text
-                    # (e.g. "5,661" or "(2,032)"). If unparseable, keep the
-                    # raw string so criterion-style usage (e.g. SUMIF) works.
-                    coerced = _coerce_string_to_float(v)
-                    kwargs[input_key] = v if math.isnan(coerced) else coerced
                 else:
+                    # Strings, numpy types, etc. pass through unchanged.
+                    # The formulas library handles strings appropriately:
+                    #   - aggregates (AVERAGE/SUM/etc) via our overrides skip text scalars
+                    #   - arithmetic coerces clean numeric strings, returns #VALUE! for
+                    #     comma-formatted/non-numeric (matches Excel)
+                    # This matches Excel's stored-type semantics.
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
     except Exception:
