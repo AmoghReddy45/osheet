@@ -808,3 +808,86 @@ def test_parse_refs_same_sheet_range():
     refs = _parse_refs("=SUM(Sheet1!A1:Sheet1!C1)", "DEFAULT")
     cells_in_sheet1 = [(r[1], r[2]) for r in refs if r[0] == "Sheet1"]
     assert len(cells_in_sheet1) == 3  # A1, B1, C1
+
+
+def test_to_float_comma_separated():
+    from osheet.evaluator import _to_float
+    assert _to_float("5,661") == 5661.0
+    assert _to_float("1,234,567") == 1234567.0
+
+
+def test_to_float_accounting_negative():
+    from osheet.evaluator import _to_float
+    assert _to_float("(2,032)") == -2032.0
+    assert _to_float("(100)") == -100.0
+
+
+def test_to_float_currency_prefix():
+    from osheet.evaluator import _to_float
+    assert _to_float("$5,661") == 5661.0
+
+
+def test_to_float_percent():
+    from osheet.evaluator import _to_float
+    assert _to_float("50%") == 0.5
+    assert _to_float("12.5%") == 0.125
+
+
+def test_to_float_whitespace():
+    from osheet.evaluator import _to_float
+    assert _to_float("  5,661  ") == 5661.0
+
+
+def test_to_float_empty_string():
+    from osheet.evaluator import _to_float
+    assert _to_float("") == 0.0
+
+
+def test_to_float_unparseable_returns_nan():
+    from osheet.evaluator import _to_float
+    import math
+    assert math.isnan(_to_float("hello"))
+    assert math.isnan(_to_float("N/A"))
+
+
+def test_average_over_comma_formatted_strings():
+    """Integration: AVERAGE works when cells contain '2,032' style strings."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '5,661'
+    ws['B1'] = '2,032'
+    ws['C1'] = '=AVERAGE(A1, B1)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    c1 = next(c for c in workbook.all_cells if c.formula and "AVERAGE" in c.formula)
+    assert abs(result[c1.stable_id] - (5661 + 2032) / 2) < 0.01
+
+
+def test_sum_over_comma_formatted_range():
+    """SUM over a range of comma-formatted strings."""
+    import io, openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws['A1'] = '1,000'
+    ws['A2'] = '(500)'  # accounting negative
+    ws['A3'] = '2,500'
+    ws['B1'] = '=SUM(A1:A3)'
+    buf = io.BytesIO(); wb.save(buf)
+
+    from osheet.parser import parse_xlsx
+    from osheet.analyzer import run_all
+    from osheet.evaluator import evaluate_patch
+    workbook = parse_xlsx(buf.getvalue())
+    run_all(workbook)
+    result = evaluate_patch({}, workbook)
+    s = next(c for c in workbook.all_cells if c.formula and "SUM" in c.formula)
+    assert abs(result[s.stable_id] - 3000) < 0.01

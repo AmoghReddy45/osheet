@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import sys
 from datetime import date, datetime, time
@@ -92,21 +93,72 @@ def _expand_range(range_key: str, default_sheet: str, value_map: dict[str, Any])
         return np.array([[np.nan]])
     sheet, c1, r1, c2, r2 = endpoints
 
-    vals = []
-    has_text = False
+    vals: list[Any] = []
+    has_unparseable_string = False
     for row in range(min(r1, r2), max(r1, r2) + 1):
         for col in range(min(c1, c2), max(c1, c2) + 1):
             v = value_map.get(f"{sheet.upper()}!{get_column_letter(col)}{row}")
             if isinstance(v, str):
-                has_text = True
-                vals.append(v)
+                # Attempt Excel-style numeric coercion (e.g. "5,661" -> 5661,
+                # "(2,032)" -> -2032). If the string is genuinely textual
+                # (e.g. SUMIF criterion like "X", a label like "Total"),
+                # keep it as-is so criteria matching still works.
+                coerced = _coerce_string_to_float(v)
+                if math.isnan(coerced):
+                    vals.append(v)
+                    has_unparseable_string = True
+                else:
+                    vals.append(coerced)
             elif v is None:
                 vals.append(0.0)  # Excel treats blanks as 0 in numeric contexts
             else:
                 vals.append(_to_float(v))
-    if has_text:
+    if has_unparseable_string:
         return np.array([vals], dtype=object)
     return np.array([vals])
+
+
+def _coerce_string_to_float(s: str) -> float:
+    """Attempt Excel-compatible numeric coercion. Returns nan if not parseable.
+
+    Handles common Excel-formatted text forms that Excel implicitly coerces
+    to numbers during arithmetic:
+      - Thousands separators:        "5,661" -> 5661.0
+      - Accounting-format negatives: "(2,032)" -> -2032.0
+      - Currency prefixes:           "$5,661" -> 5661.0
+      - Percentages:                 "50%" -> 0.5
+      - Leading/trailing whitespace: "  5,661  " -> 5661.0
+      - Scientific notation:         "5.66e3" -> 5660.0 (via float())
+      - Empty string:                "" -> 0.0 (Excel arithmetic convention)
+    """
+    s = s.strip()
+    if not s:
+        return 0.0  # empty string -> 0 in arithmetic
+    is_negative = False
+    # Accounting format: (1,234) means -1234
+    if s.startswith("(") and s.endswith(")"):
+        is_negative = True
+        s = s[1:-1].strip()
+    # Strip currency symbols (extend as needed)
+    for sym in ("$", "€", "£", "¥"):
+        if s.startswith(sym):
+            s = s[len(sym):].strip()
+            break
+    # Percentage
+    is_percent = s.endswith("%")
+    if is_percent:
+        s = s[:-1].strip()
+    # Remove thousands separators
+    s = s.replace(",", "")
+    try:
+        v = float(s)
+        if is_percent:
+            v /= 100.0
+        if is_negative:
+            v = -v
+        return v
+    except (ValueError, TypeError):
+        return float("nan")
 
 
 def _to_float(val: Any) -> float:
@@ -117,8 +169,12 @@ def _to_float(val: Any) -> float:
         # YEAR/EDATE/EOMONTH/TEXT/etc. (which the formulas lib implements
         # against serials) work, instead of erroring with #VALUE!.
         return _datetime_to_serial(val)
+    if isinstance(val, bool):
+        return float(val)
     if isinstance(val, (int, float)):
         return float(val)
+    if isinstance(val, str):
+        return _coerce_string_to_float(val)
     # Try numpy scalar extraction
     try:
         arr = np.array(val)
@@ -249,6 +305,9 @@ def _eval_subexpr(expr: str, default_sheet: str, value_map: dict[str, Any], pars
             v = value_map.get(lookup)
             if isinstance(v, (int, float, type(None), datetime, date, time)):
                 kwargs[input_key] = _to_float(v)
+            elif isinstance(v, str):
+                coerced = _coerce_string_to_float(v)
+                kwargs[input_key] = v if math.isnan(coerced) else coerced
             else:
                 kwargs[input_key] = v
     result = _scalar(func(**kwargs))
@@ -292,6 +351,9 @@ def _eval_subexpr_scalar(
                 v = value_map.get(lookup)
                 if isinstance(v, (int, float, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
+                elif isinstance(v, str):
+                    coerced = _coerce_string_to_float(v)
+                    kwargs[input_key] = v if math.isnan(coerced) else coerced
                 else:
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
@@ -821,6 +883,12 @@ def _eval_one_cell(
                 v = value_map.get(lookup_key)
                 if isinstance(v, (int, float, type(None), datetime, date, time)):
                     kwargs[input_key] = _to_float(v)
+                elif isinstance(v, str):
+                    # Excel-style implicit numeric coercion of formatted text
+                    # (e.g. "5,661" or "(2,032)"). If unparseable, keep the
+                    # raw string so criterion-style usage (e.g. SUMIF) works.
+                    coerced = _coerce_string_to_float(v)
+                    kwargs[input_key] = v if math.isnan(coerced) else coerced
                 else:
                     kwargs[input_key] = v
         return _scalar(func(**kwargs))
